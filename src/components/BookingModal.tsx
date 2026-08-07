@@ -83,31 +83,32 @@ export function isSlotTimePassed(
 async function sendWhatsAppDirectMessage(contactNumber: string, messageText: string) {
   const cleanPhone = contactNumber.replace(/\D/g, "");
   const formattedNumber = cleanPhone.startsWith("91") ? cleanPhone : `91${cleanPhone}`;
-  const apiKey = process.env.NEXT_PUBLIC_WHATSAPP_API_KEY || "vR39h6avY69g7kAU3YQbS6V6XEvudson";
 
-  // 1. Try Next.js same-origin rewrite path with apikey header
+  // 1. Call server API proxy route to send via ev0.infispark.in (bypasses browser CORS restriction)
   try {
-    const res = await fetch("/ev0-api/message/sendText/Ahtemad", {
+    const res = await fetch("/api/whatsapp/send", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        apikey: apiKey,
       },
       body: JSON.stringify({
+        instance: "Ahtemad",
         number: formattedNumber,
         text: messageText,
       }),
     });
-    if (res.ok) {
-      console.log(`✅ WhatsApp message sent to ${formattedNumber} via ev0 rewrite proxy`);
+    const data = await res.json();
+    if (res.ok && data.success) {
+      console.log(`✅ WhatsApp message sent to ${formattedNumber} via ev0.infispark.in API proxy`);
       return;
     }
-  } catch (err) {
-    console.warn("⚠️ Same-origin rewrite fetch failed, attempting direct fetch:", err);
+  } catch (error) {
+    console.warn("⚠️ Internal WhatsApp proxy error, trying fallback:", error);
   }
 
-  // 2. Direct fetch with apikey header
+  // 2. Fallback to direct ev0 call or fallback endpoint if proxy unavailable
   try {
+    const apiKey = process.env.NEXT_PUBLIC_WHATSAPP_API_KEY || "vR39h6avY69g7kAU3YQbS6V6XEvudson";
     await fetch("https://ev0.infispark.in/message/sendText/Ahtemad", {
       method: "POST",
       headers: {
@@ -119,9 +120,9 @@ async function sendWhatsAppDirectMessage(contactNumber: string, messageText: str
         text: messageText,
       }),
     });
-    console.log(`✅ WhatsApp message dispatched to ${formattedNumber} via direct ev0 endpoint`);
-  } catch (error) {
-    console.error("❌ Direct WhatsApp ev0 error:", error);
+    console.log(`✅ WhatsApp message sent to ${formattedNumber} via direct ev0.infispark.in`);
+  } catch (fallbackError) {
+    console.error("❌ WhatsApp fallback error:", fallbackError);
   }
 }
 
@@ -402,6 +403,26 @@ export function BookingModal({
       const welcomeText = `Hello ${contactInfo.fullName || "Partner"},\n\nThank you for applying for the Talbina Distributor Partnership Program 2026! Our team will contact you soon.`;
 
       sendWhatsAppDirectMessage(cleanUserPhone, welcomeText);
+
+      // Asynchronously trigger Meta Conversions API (CAPI) for Lead
+      try {
+        fetch("/api/whatsapp/capi-event", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            eventName: "Lead",
+            eventSourceUrl: typeof window !== "undefined" ? window.location.href : "https://talbina.in/survey",
+            email: contactInfo.email,
+            phone: cleanUserPhone,
+            fullName: contactInfo.fullName,
+            customData: {
+              content_name: activeCampaign.title || "Talbina Distributor Partnership",
+              currency: "INR",
+              value: 0,
+            },
+          }),
+        }).catch(() => {});
+      } catch (e) {}
     } catch (err) {
       console.error("Submit Step 1 Error:", err);
     } finally {
@@ -442,6 +463,20 @@ export function BookingModal({
     saveOrUpdateLead(surveyPayload, emailPrefixId, createdDate, activeCampaign.id).catch((err) =>
       console.error("Async survey saveOrUpdateLead error:", err)
     );
+
+    try {
+      fetch("/api/whatsapp/auto-send-survey", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          instanceName: "mudassir",
+          session: "mudassir",
+          fullName: contactInfo.fullName,
+          email: contactInfo.email,
+          phone: `${contactInfo.countryCode}${contactInfo.phone.replace(/\D/g, "")}`,
+        }),
+      }).catch(() => {});
+    } catch (e) {}
   };
 
   const handleReset = () => {
@@ -520,6 +555,25 @@ export function BookingModal({
     const formattedMonth = (currentMonthIndex + 1).toString().padStart(2, "0");
     const formattedDay = selectedDay.toString().padStart(2, "0");
     const appointmentDateStr = `${currentYear}-${formattedMonth}-${formattedDay}`;
+
+    try {
+      fetch("/api/whatsapp/capi-event", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          eventName: "Schedule",
+          eventSourceUrl: typeof window !== "undefined" ? window.location.href : "https://talbina.in/success",
+          email: contactInfo.email,
+          phone: `${contactInfo.countryCode}${contactInfo.phone.replace(/\D/g, "")}`,
+          fullName: contactInfo.fullName,
+          customData: {
+            content_name: "Talbina Partnership Call Booking",
+            meeting_date: appointmentDateStr,
+            meeting_time: time,
+          },
+        }),
+      }).catch(() => {});
+    } catch (e) {}
 
     const completedPayload: LeadData = {
       fullName: contactInfo.fullName,
