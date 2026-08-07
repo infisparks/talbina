@@ -85,25 +85,23 @@ async function sendWhatsAppDirectMessage(contactNumber: string, messageText: str
   const formattedNumber = cleanPhone.startsWith("91") ? cleanPhone : `91${cleanPhone}`;
 
   try {
-    const res = await fetch("/api/whatsapp/send", {
+    const res = await fetch("https://ev0.infispark.in/message/sendText/Ahtemad", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        instance: "Ahtemad",
         number: formattedNumber,
         text: messageText,
       }),
     });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok && data.success) {
-      console.log(`✅ WhatsApp message sent to ${formattedNumber} via server proxy (${data.provider})`);
+    if (res.ok) {
+      console.log(`✅ WhatsApp message sent to ${formattedNumber} via ev0.infispark.in`);
     } else {
-      console.warn("⚠️ WhatsApp dispatch response:", data);
+      console.warn("⚠️ WhatsApp ev0 response status:", res.status);
     }
   } catch (error) {
-    console.error("❌ WhatsApp dispatch error:", error);
+    console.error("❌ Direct WhatsApp ev0 error:", error);
   }
 }
 
@@ -384,26 +382,6 @@ export function BookingModal({
       const welcomeText = `Hello ${contactInfo.fullName || "Partner"},\n\nThank you for applying for the Talbina Distributor Partnership Program 2026! Our team will contact you soon.`;
 
       sendWhatsAppDirectMessage(cleanUserPhone, welcomeText);
-
-      // Asynchronously trigger Meta Conversions API (CAPI) for Lead
-      try {
-        fetch("/api/whatsapp/capi-event", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            eventName: "Lead",
-            eventSourceUrl: typeof window !== "undefined" ? window.location.href : "https://talbina.in/survey",
-            email: contactInfo.email,
-            phone: cleanUserPhone,
-            fullName: contactInfo.fullName,
-            customData: {
-              content_name: activeCampaign.title || "Talbina Distributor Partnership",
-              currency: "INR",
-              value: 0,
-            },
-          }),
-        }).catch(() => {});
-      } catch (e) {}
     } catch (err) {
       console.error("Submit Step 1 Error:", err);
     } finally {
@@ -444,20 +422,6 @@ export function BookingModal({
     saveOrUpdateLead(surveyPayload, emailPrefixId, createdDate, activeCampaign.id).catch((err) =>
       console.error("Async survey saveOrUpdateLead error:", err)
     );
-
-    try {
-      fetch("/api/whatsapp/auto-send-survey", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          instanceName: "mudassir",
-          session: "mudassir",
-          fullName: contactInfo.fullName,
-          email: contactInfo.email,
-          phone: `${contactInfo.countryCode}${contactInfo.phone.replace(/\D/g, "")}`,
-        }),
-      }).catch(() => {});
-    } catch (e) {}
   };
 
   const handleReset = () => {
@@ -536,25 +500,6 @@ export function BookingModal({
     const formattedMonth = (currentMonthIndex + 1).toString().padStart(2, "0");
     const formattedDay = selectedDay.toString().padStart(2, "0");
     const appointmentDateStr = `${currentYear}-${formattedMonth}-${formattedDay}`;
-
-    try {
-      fetch("/api/whatsapp/capi-event", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          eventName: "Schedule",
-          eventSourceUrl: typeof window !== "undefined" ? window.location.href : "https://talbina.in/success",
-          email: contactInfo.email,
-          phone: `${contactInfo.countryCode}${contactInfo.phone.replace(/\D/g, "")}`,
-          fullName: contactInfo.fullName,
-          customData: {
-            content_name: "Talbina Partnership Call Booking",
-            meeting_date: appointmentDateStr,
-            meeting_time: time,
-          },
-        }),
-      }).catch(() => {});
-    } catch (e) {}
 
     const completedPayload: LeadData = {
       fullName: contactInfo.fullName,
