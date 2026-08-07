@@ -90,7 +90,7 @@ export default function Home({
     const params = new URLSearchParams(window.location.search);
     const testCode = params.get("test_event_code") || params.get("fbtest") || undefined;
 
-    fetch(`${serverUrl}/api/whatsapp/capi-event`, {
+    fetch("/api/whatsapp/capi-event", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
