@@ -11,7 +11,9 @@ export async function POST(request: Request) {
       process.env.NEXT_PUBLIC_WHATSAPP_API_KEY ||
       "vR39h6avY69g7kAU3YQbS6V6XEvudson";
 
-    const targetUrl = `https://ev0.infispark.in/message/sendText/${instance}`;
+    const serverUrl = (process.env.NEXT_PUBLIC_WHATSAPP_SERVER_URL || "https://evo.infispark.in").replace(/\/$/, "");
+    const targetUrl = `${serverUrl}/message/sendText/${instance}`;
+
     const res = await fetch(targetUrl, {
       method: "POST",
       headers: {

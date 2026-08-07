@@ -1,6 +1,6 @@
 export default {
   async fetch(request, env, ctx) {
-    // Standard CORS headers allowing requests from any web origin (including Vercel & localhost)
+    // Enable CORS headers so requests from any browser origin work without CORS errors
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -21,8 +21,11 @@ export default {
         const body = await request.json();
         const number = body.number;
         const text = body.text;
-        const instance = body.instance || "Ahtemad";
-        const apiKey = body.apikey || "vR39h6avY69g7kAU3YQbS6V6XEvudson";
+
+        // Read from Cloudflare Worker Environment Variables (env) or fallback to defaults
+        const instance = body.instance || env.WHATSAPP_INSTANCE || "Ahtemad";
+        const apiKey = body.apikey || env.WHATSAPP_API_KEY || "vR39h6avY69g7kAU3YQbS6V6XEvudson";
+        const serverUrl = (env.WHATSAPP_SERVER_URL || "https://evo.infispark.in").replace(/\/$/, "");
 
         if (!number || !text) {
           return new Response(
@@ -31,9 +34,9 @@ export default {
           );
         }
 
-        const targetUrl = `https://ev0.infispark.in/message/sendText/${instance}`;
+        const targetUrl = `${serverUrl}/message/sendText/${instance}`;
 
-        // Forward request to ev0 server with apikey header
+        // Forward request to WhatsApp server with apikey header
         const res = await fetch(targetUrl, {
           method: "POST",
           headers: {

@@ -71,7 +71,7 @@ export interface StageAutomationRule {
   isEnabled: boolean;
 }
 
-const SERVER_URL = (process.env.NEXT_PUBLIC_WHATSAPP_SERVER_URL || "https://ev0.infispark.in").replace(/\/$/, "");
+const SERVER_URL = (process.env.NEXT_PUBLIC_WHATSAPP_SERVER_URL || "https://evo.infispark.in").replace(/\/$/, "");
 
 // Pipeline Stages Config
 const DEFAULT_PIPELINE_STAGES: PipelineStageConfig[] = [

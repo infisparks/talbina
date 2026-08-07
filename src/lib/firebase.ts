@@ -21,7 +21,7 @@ export const auth = getAuth(app);
 const WHATSAPP_SERVER_URL = (
   typeof process !== "undefined" && process.env.NEXT_PUBLIC_WHATSAPP_SERVER_URL
     ? process.env.NEXT_PUBLIC_WHATSAPP_SERVER_URL
-    : "https://ev0.infispark.in"
+    : "https://evo.infispark.in"
 ).replace(/\/$/, "");
 
 export interface SurveyData {
