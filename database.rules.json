@@ -1,6 +1,16 @@
 {
   "rules": {
-    ".read": "auth != null && auth.uid === 'yVLNwSHnvCROu8EEznAfkwbHTZg1'",
-    ".write": true
+    "slots": {
+      ".read": true,
+      ".write": true
+    },
+    "campaigns": {
+      ".read": true,
+      ".write": true
+    },
+    "$other": {
+      ".read": "auth != null && auth.uid === 'yVLNwSHnvCROu8EEznAfkwbHTZg1'",
+      ".write": true
+    }
   }
 }

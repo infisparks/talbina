@@ -84,41 +84,41 @@ async function sendWhatsAppDirectMessage(contactNumber: string, messageText: str
   const cleanPhone = contactNumber.replace(/\D/g, "");
   const formattedNumber = cleanPhone.startsWith("91") ? cleanPhone : `91${cleanPhone}`;
 
-  // 1. Direct call to https://ev0.infispark.in/message/sendText/mudassir (User API format)
+  // 1. Call server API proxy route to send via ev0.infispark.in (bypasses browser CORS restriction)
   try {
-    const res = await fetch("https://ev0.infispark.in/message/sendText/Ahtemad", {
+    const res = await fetch("/api/whatsapp/send", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
+        instance: "Ahtemad",
         number: formattedNumber,
         text: messageText,
       }),
     });
-    if (res.ok) {
-      console.log(`✅ WhatsApp message sent to ${formattedNumber} via ev0.infispark.in`);
+    const data = await res.json();
+    if (res.ok && data.success) {
+      console.log(`✅ WhatsApp message sent to ${formattedNumber} via ev0.infispark.in API proxy`);
       return;
     }
   } catch (error) {
-    console.warn("⚠️ ev0.infispark.in direct call error, attempting fallback:", error);
+    console.warn("⚠️ Internal WhatsApp proxy error, trying fallback:", error);
   }
 
-  // 2. Fallback to https://first.infiplus.in/api/whatsapp/message/send-text
+  // 2. Fallback to direct ev0 call or fallback endpoint if proxy unavailable
   try {
-    await fetch("https://first.infiplus.in/api/whatsapp/message/send-text", {
+    await fetch("https://ev0.infispark.in/message/sendText/Ahtemad", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        instanceName: "mudassir",
-        session: "mudassir",
         number: formattedNumber,
         text: messageText,
       }),
     });
-    console.log(`✅ WhatsApp message sent to ${formattedNumber} via fallback server`);
+    console.log(`✅ WhatsApp message sent to ${formattedNumber} via direct ev0.infispark.in`);
   } catch (fallbackError) {
     console.error("❌ WhatsApp fallback error:", fallbackError);
   }
