@@ -83,7 +83,7 @@ export function isSlotTimePassed(
 async function sendWhatsAppDirectMessage(contactNumber: string, messageText: string) {
   const cleanPhone = contactNumber.replace(/\D/g, "");
   const formattedNumber = cleanPhone.startsWith("91") ? cleanPhone : `91${cleanPhone}`;
-  const apiKey = process.env.NEXT_PUBLIC_WHATSAPP_API_KEY || "mudassir";
+  const apiKey = process.env.NEXT_PUBLIC_WHATSAPP_API_KEY || "vR39h6avY69g7kAU3YQbS6V6XEvudson";
 
   // 1. Try Next.js same-origin rewrite path with apikey header
   try {
