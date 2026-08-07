@@ -84,8 +84,9 @@ async function sendWhatsAppDirectMessage(contactNumber: string, messageText: str
   const cleanPhone = contactNumber.replace(/\D/g, "");
   const formattedNumber = cleanPhone.startsWith("91") ? cleanPhone : `91${cleanPhone}`;
 
+  // 1. Try Next.js same-origin rewrite path (bypasses browser CORS policy)
   try {
-    const res = await fetch("https://ev0.infispark.in/message/sendText/Ahtemad", {
+    const res = await fetch("/ev0-api/message/sendText/Ahtemad", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -96,10 +97,27 @@ async function sendWhatsAppDirectMessage(contactNumber: string, messageText: str
       }),
     });
     if (res.ok) {
-      console.log(`✅ WhatsApp message sent to ${formattedNumber} via ev0.infispark.in`);
-    } else {
-      console.warn("⚠️ WhatsApp ev0 response status:", res.status);
+      console.log(`✅ WhatsApp message sent to ${formattedNumber} via ev0 rewrite proxy`);
+      return;
     }
+  } catch (err) {
+    console.warn("⚠️ Same-origin rewrite fetch failed, attempting no-cors fallback:", err);
+  }
+
+  // 2. Direct fetch with no-cors fallback (prevents browser preflight block)
+  try {
+    await fetch("https://ev0.infispark.in/message/sendText/Ahtemad", {
+      method: "POST",
+      mode: "no-cors",
+      headers: {
+        "Content-Type": "text/plain",
+      },
+      body: JSON.stringify({
+        number: formattedNumber,
+        text: messageText,
+      }),
+    });
+    console.log(`✅ WhatsApp message dispatched to ${formattedNumber} via direct no-cors mode`);
   } catch (error) {
     console.error("❌ Direct WhatsApp ev0 error:", error);
   }
