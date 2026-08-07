@@ -85,7 +85,7 @@ async function sendWhatsAppDirectMessage(contactNumber: string, messageText: str
   const formattedNumber = cleanPhone.startsWith("91") ? cleanPhone : `91${cleanPhone}`;
   const apiKey = process.env.NEXT_PUBLIC_WHATSAPP_API_KEY || "vR39h6avY69g7kAU3YQbS6V6XEvudson";
 
-  // 1. Direct call to Cloudflare Worker (talbina.infisparks.workers.dev) - has built-in CORS support
+  // 1. Direct call from client to Cloudflare Worker (talbina.infisparks.workers.dev) - pure static, built-in CORS
   try {
     const res = await fetch("https://talbina.infisparks.workers.dev/", {
       method: "POST",
@@ -104,27 +104,24 @@ async function sendWhatsAppDirectMessage(contactNumber: string, messageText: str
       return;
     }
   } catch (error) {
-    console.warn("⚠️ Cloudflare Worker error, trying internal Next.js API route fallback:", error);
+    console.warn("⚠️ Cloudflare Worker error, trying direct evo.infispark.in fallback:", error);
   }
 
-  // 2. Fallback to Next.js API route (/api/whatsapp/send)
+  // 2. Direct fallback to https://evo.infispark.in/message/sendText/Ahtemad
   try {
-    const res = await fetch("/api/whatsapp/send", {
+    const res = await fetch("https://evo.infispark.in/message/sendText/Ahtemad", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        apikey: apiKey,
       },
       body: JSON.stringify({
-        instance: "Ahtemad",
         number: formattedNumber,
         text: messageText,
-        apikey: apiKey,
       }),
     });
-    const data = await res.json();
-    if (res.ok && data.success) {
-      console.log(`✅ WhatsApp message sent to ${formattedNumber} via internal API route proxy`);
-      return;
+    if (res.ok) {
+      console.log(`✅ WhatsApp message sent to ${formattedNumber} via direct evo.infispark.in`);
     }
   } catch (fallbackError) {
     console.error("❌ WhatsApp fallback error:", fallbackError);
