@@ -1,0 +1,86 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: 'Poppins', system-ui, -apple-system, sans-serif;
+  --color-brandDark: #052213;
+  --color-brandGreen: #08321D;
+  --color-brandLightGreen: #0E462A;
+  --color-brandCream: #FAF7ED;
+  --color-brandCreamDark: #F3EFE0;
+  --color-brandYellowCard: #FDF7E2;
+  --color-brandGold: #DFB75A;
+  --color-brandGoldLight: #F7E3A3;
+  --color-brandGoldDark: #B88D32;
+  --color-brandPillGreen: #D7F2E3;
+  --color-brandHighlightRed: #DC2626;
+}
+
+@layer base {
+  * {
+    font-family: 'Poppins', system-ui, -apple-system, sans-serif;
+  }
+  body {
+    background-color: #FAF7ED;
+    color: #1A202C;
+    font-family: 'Poppins', system-ui, -apple-system, sans-serif;
+    -webkit-tap-highlight-color: transparent;
+    overflow-x: hidden;
+  }
+}
+
+/* Metallic Gold Gradient Text */
+.text-gold-gradient {
+  background: linear-gradient(135deg, #DFB75A 0%, #FFF2C6 40%, #C99E3F 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+/* Metallic Gold Button Shimmer */
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.btn-shimmer {
+  background: linear-gradient(90deg, #DFB75A 0%, #FDF0B8 30%, #DFB75A 60%, #C99E3F 100%);
+  background-size: 200% 100%;
+  animation: shimmer 4s infinite linear;
+}
+
+/* Pulse Ambient Glow */
+@keyframes pulseGlow {
+  0%, 100% { opacity: 0.35; transform: scale(1); }
+  50% { opacity: 0.75; transform: scale(1.08); }
+}
+.glow-effect {
+  animation: pulseGlow 5s infinite ease-in-out;
+}
+
+/* Luxury Fine Pattern Background */
+.bg-luxury-pattern {
+  background-image: radial-gradient(rgba(8, 50, 29, 0.04) 1px, transparent 0);
+  background-size: 24px 24px;
+}
+
+/* Shadow Glow Utilities */
+.shadow-gold-glow {
+  box-shadow: 0 10px 30px -5px rgba(223, 183, 90, 0.35);
+}
+.shadow-premium {
+  box-shadow: 0 20px 40px -15px rgba(8, 50, 29, 0.12);
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #FAF7ED;
+}
+::-webkit-scrollbar-thumb {
+  background: #0E462A;
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #DFB75A;
+}

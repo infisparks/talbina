@@ -1,0 +1,5506 @@
+"use client";
+
+import React, { useState, useEffect, useCallback } from "react";
+import { useRouter } from "next/navigation";
+import {
+  auth,
+  getLeadsForDate,
+  getMeetingsForDate,
+  getAllMeetings,
+  getAllLeadsAcrossDates,
+  deleteLead,
+  saveOrUpdateLead,
+  updateLeadStaffFields,
+  getRoles,
+  createRole,
+  deleteRole,
+  syncAndGetUser,
+  getAllUsers,
+  setUserRoleByEmail,
+  registerUserByEmail,
+  updateUserStaffDetails,
+  getAllSupportTickets,
+  updateSupportTicketStatus,
+  deleteSupportTicket,
+  SupportTicket,
+  MASTER_ADMIN_UID,
+  sanitizeEmailToId,
+  LeadData,
+  StaffNote,
+  RoleData,
+  UserData,
+  db,
+  markDateAsBooked,
+  markSlotsAsBooked,
+  unmarkDateOrSlot,
+  getAllBlockedSlotsAndDates,
+  DEFAULT_DAILY_TIME_SLOTS,
+} from "@/lib/firebase";
+import {
+  signOut,
+  onAuthStateChanged,
+  User,
+} from "firebase/auth";
+import { ref, onValue, set } from "firebase/database";
+import { CAMPAIGNS } from "@/config/campaigns";
+
+const MONTH_NAMES = [
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December"
+];
+
+export interface PipelineStageConfig {
+  id: string;
+  name: string;
+  color: string;
+  bgTag: string;
+  isCompulsory?: boolean;
+  isDeleted?: boolean;
+}
+
+export interface StageAutomationRule {
+  id: string;
+  stageId: string;
+  title: string;
+  instanceName?: string;
+  triggerBase: "meeting" | "created";
+  offsetType: "before" | "after";
+  offsetValue: number;
+  offsetUnit: "minutes" | "hours" | "days";
+  template: string;
+  isEnabled: boolean;
+}
+
+const SERVER_URL = (process.env.NEXT_PUBLIC_WHATSAPP_SERVER_URL || "https://ev0.infispark.in").replace(/\/$/, "");
+
+// Pipeline Stages Config
+const DEFAULT_PIPELINE_STAGES: PipelineStageConfig[] = [
+  { id: "raw", name: "Leads", color: "#6366f1", bgTag: "bg-indigo-50 text-indigo-700 border-indigo-200", isCompulsory: true, isDeleted: false },
+  { id: "in_progress", name: "1st Connection", color: "#3b82f6", bgTag: "bg-blue-50 text-blue-700 border-blue-200", isCompulsory: false, isDeleted: false },
+  { id: "survey_completed", name: "Survey Completed", color: "#06b6d4", bgTag: "bg-cyan-50 text-cyan-700 border-cyan-200", isCompulsory: false, isDeleted: false },
+  { id: "meeting_booked", name: "Meeting Booked", color: "#10b981", bgTag: "bg-emerald-50 text-emerald-700 border-emerald-200", isCompulsory: false, isDeleted: false },
+  { id: "proposal_sent", name: "Proposal Sent", color: "#f59e0b", bgTag: "bg-amber-50 text-amber-700 border-amber-200", isCompulsory: false, isDeleted: false },
+  { id: "won", name: "Won", color: "#16a34a", bgTag: "bg-green-50 text-green-800 border-green-200", isCompulsory: true, isDeleted: false },
+  { id: "not_qualified", name: "Not Qualified", color: "#f43f5e", bgTag: "bg-rose-50 text-rose-700 border-rose-200", isCompulsory: false, isDeleted: false },
+];
+
+function parseMeetingDateTime(dateStr?: string, timeStr?: string): Date | null {
+  if (!dateStr) return null;
+  try {
+    const rawDate = String(dateStr).trim();
+    const cleanDate = rawDate.split("T")[0];
+    const dateParts = cleanDate.split(/[-/]/);
+
+    let year = 0, month = 0, day = 0;
+
+    if (dateParts.length === 3) {
+      const p0 = parseInt(dateParts[0], 10);
+      const p1 = parseInt(dateParts[1], 10);
+      const p2 = parseInt(dateParts[2], 10);
+
+      if (p0 > 1000) {
+        // YYYY-MM-DD or YYYY/MM/DD
+        year = p0;
+        month = p1 - 1;
+        day = p2;
+      } else if (p2 > 1000) {
+        // DD-MM-YYYY or MM-DD-YYYY or DD/MM/YYYY
+        year = p2;
+        if (p0 > 12) {
+          day = p0;
+          month = p1 - 1;
+        } else if (p1 > 12) {
+          month = p0 - 1;
+          day = p1;
+        } else {
+          day = p0;
+          month = p1 - 1;
+        }
+      }
+    }
+
+    let hour = 12;
+    let minute = 0;
+
+    if (timeStr) {
+      const cleanTime = String(timeStr).trim().toUpperCase();
+      if (cleanTime.includes("AM") || cleanTime.includes("PM")) {
+        const isPm = cleanTime.includes("PM");
+        const timePart = cleanTime.replace("AM", "").replace("PM", "").trim();
+        const parts = timePart.split(":");
+        hour = parseInt(parts[0], 10);
+        if (isPm && hour < 12) hour += 12;
+        if (!isPm && hour === 12) hour = 0;
+        if (parts[1]) minute = parseInt(parts[1], 10);
+      } else if (cleanTime.includes(":")) {
+        const parts = cleanTime.split(":");
+        hour = parseInt(parts[0], 10);
+        minute = parseInt(parts[1], 10);
+      }
+    }
+
+    if (year > 1900 && month >= 0 && month <= 11 && day >= 1 && day <= 31) {
+      const dt = new Date(year, month, day, hour, minute, 0);
+      return isNaN(dt.getTime()) ? null : dt;
+    }
+
+    const dt = new Date(`${cleanDate}T${hour.toString().padStart(2, "0")}:${minute.toString().padStart(2, "0")}:00`);
+    return isNaN(dt.getTime()) ? null : dt;
+  } catch (err) {
+    return null;
+  }
+}
+
+function formatShortTime(timeStr: string): string {
+  if (!timeStr) return "";
+  const clean = timeStr.trim();
+  if (clean.includes("AM") || clean.includes("PM")) {
+    const isPm = clean.includes("PM");
+    const parts = clean.split(":");
+    const hour = parseInt(parts[0], 10);
+    return `${hour}${isPm ? "p" : "a"}`;
+  }
+  return clean;
+}
+
+function isMeetingInPast(meetingDateStr?: string, timeStr?: string): boolean {
+  if (!meetingDateStr) return false;
+  try {
+    const cleanDate = meetingDateStr.split("T")[0];
+    let hour = 12;
+    let minute = 0;
+
+    if (timeStr) {
+      const cleanTime = timeStr.trim();
+      if (cleanTime.includes("AM") || cleanTime.includes("PM")) {
+        const isPm = cleanTime.includes("PM");
+        const timePart = cleanTime.replace("AM", "").replace("PM", "").trim();
+        const parts = timePart.split(":");
+        hour = parseInt(parts[0], 10);
+        if (isPm && hour < 12) hour += 12;
+        if (!isPm && hour === 12) hour = 0;
+        if (parts[1]) minute = parseInt(parts[1], 10);
+      } else if (cleanTime.includes(":")) {
+        const parts = cleanTime.split(":");
+        hour = parseInt(parts[0], 10);
+        minute = parseInt(parts[1], 10);
+      }
+    }
+
+    const meetingDateTime = new Date(`${cleanDate}T${hour.toString().padStart(2, "0")}:${minute.toString().padStart(2, "0")}:00`);
+    const now = new Date();
+    return meetingDateTime < now;
+  } catch (err) {
+    return false;
+  }
+}
+
+function getLeadEffectiveStage(lead: LeadData): string {
+  let stage = lead.pipelineStage;
+
+  // Normalize legacy and alias stage identifiers
+  if (!stage || stage === "contact_saved" || stage === "partial" || stage === "leads" || stage === "lead") {
+    stage = "raw";
+  }
+  if (stage === "completed" || stage === "booked" || stage === "meeting") {
+    stage = "meeting_booked";
+  }
+  if (stage === "survey") {
+    stage = "survey_completed";
+  }
+
+  // Automatic inferencing if stage is default raw or empty
+  if (stage === "raw") {
+    const rawStatus = (lead.status as string) || "";
+    if (rawStatus === "won") return "won";
+    if (rawStatus === "not_qualified") return "not_qualified";
+    if (lead.meeting?.meetingDate || rawStatus === "completed") return "meeting_booked";
+    if ((lead.survey && Object.keys(lead.survey).length > 0) || rawStatus === "survey_completed") return "survey_completed";
+  }
+
+  return stage;
+}
+
+export default function CRMPage() {
+  const router = useRouter();
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [currentUserData, setCurrentUserData] = useState<UserData | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [accessDenied, setAccessDenied] = useState(false);
+
+  // CRM Dashboard State
+  const today = new Date();
+  const todayStr = today.toISOString().split("T")[0];
+
+  const sevenDaysAgoObj = new Date(today);
+  sevenDaysAgoObj.setDate(sevenDaysAgoObj.getDate() - 7);
+  const sevenDaysAgoStr = sevenDaysAgoObj.toISOString().split("T")[0];
+
+  const sevenDaysAheadObj = new Date(today);
+  sevenDaysAheadObj.setDate(sevenDaysAheadObj.getDate() + 7);
+  const sevenDaysAheadStr = sevenDaysAheadObj.toISOString().split("T")[0];
+
+  const [selectedDate, setSelectedDate] = useState<string>(todayStr);
+  const [selectedCampaign, setSelectedCampaign] = useState<string>("all");
+  const [activeTab, setActiveTab] = useState<"leads" | "pipeline" | "meetings" | "calendar" | "roles" | "tickets">("pipeline");
+
+  // Support Tickets Management State
+  const [supportTickets, setSupportTickets] = useState<SupportTicket[]>([]);
+  const [isLoadingTickets, setIsLoadingTickets] = useState(false);
+  const [ticketSearchQuery, setTicketSearchQuery] = useState("");
+  const [ticketStatusFilter, setTicketStatusFilter] = useState<string>("all");
+  const [ticketLevelFilter, setTicketLevelFilter] = useState<string>("all");
+
+  // Read URL query parameter on initial load to preserve route state on refresh
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      const tabParam = params.get("tab") as any;
+      if (tabParam && ["leads", "pipeline", "meetings", "calendar", "roles", "tickets"].includes(tabParam)) {
+        setActiveTab(tabParam);
+      }
+    }
+  }, []);
+
+  // Helper to switch active tab and sync URL query parameter
+  const changeTab = useCallback((tab: "leads" | "pipeline" | "meetings" | "calendar" | "roles" | "tickets") => {
+    setActiveTab(tab);
+    if (typeof window !== "undefined") {
+      const url = new URL(window.location.href);
+      url.searchParams.set("tab", tab);
+      window.history.pushState({}, "", url.toString());
+    }
+  }, []);
+
+  // Pipeline board scroll ref & helper for easy mobile scrolling
+  const pipelineBoardRef = React.useRef<HTMLDivElement>(null);
+
+  const scrollPipeline = (direction: "left" | "right") => {
+    if (pipelineBoardRef.current) {
+      const scrollAmount = 320;
+      pipelineBoardRef.current.scrollBy({
+        left: direction === "left" ? -scrollAmount : scrollAmount,
+        behavior: "smooth",
+      });
+    }
+  };
+
+  const scrollToStageColumn = (stageId: string) => {
+    if (pipelineBoardRef.current) {
+      const colElement = pipelineBoardRef.current.querySelector(`#stage-col-${stageId}`);
+      if (colElement) {
+        colElement.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "start" });
+      }
+    }
+  };
+
+  // Data State
+  const [leadsList, setLeadsList] = useState<LeadData[]>([]);
+  const [allLeadsList, setAllLeadsList] = useState<LeadData[]>([]);
+  const [meetingsList, setMeetingsList] = useState<any[]>([]);
+  const [allMeetingsList, setAllMeetingsList] = useState<any[]>([]);
+  const [rolesList, setRolesList] = useState<RoleData[]>([]);
+  const [usersList, setUsersList] = useState<UserData[]>([]);
+  const [isDataLoading, setIsDataLoading] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [statusFilter, setStatusFilter] = useState<string>("all");
+
+  // ROLES & USER MANAGEMENT STATE
+  const [newRoleName, setNewRoleName] = useState("");
+  const [newRoleDescription, setNewRoleDescription] = useState("");
+  const [isCreatingRole, setIsCreatingRole] = useState(false);
+  const [roleErrorMessage, setRoleErrorMessage] = useState<string | null>(null);
+  const [roleSuccessMessage, setRoleSuccessMessage] = useState<string | null>(null);
+
+  // MANUAL EMAIL USER REGISTRATION STATE
+  const [newRegisterName, setNewRegisterName] = useState("");
+  const [newRegisterEmail, setNewRegisterEmail] = useState("");
+  const [newRegisterPhone, setNewRegisterPhone] = useState("");
+  const [newRegisterUid, setNewRegisterUid] = useState("");
+  const [newRegisterRoleId, setNewRegisterRoleId] = useState("role_onboarding");
+  const [isRegisteringUser, setIsRegisteringUser] = useState(false);
+
+  // EDIT STAFF USER MODAL STATE
+  const [editingStaffUser, setEditingStaffUser] = useState<UserData | null>(null);
+  const [editStaffName, setEditStaffName] = useState("");
+  const [editStaffPhone, setEditStaffPhone] = useState("");
+  const [editStaffUid, setEditStaffUid] = useState("");
+  const [editStaffRoleId, setEditStaffRoleId] = useState("");
+  const [isSavingStaffEdit, setIsSavingStaffEdit] = useState(false);
+
+  // Pipeline Advanced Date Filter Controls
+  const [pipelineTargetField, setPipelineTargetField] = useState<"meeting" | "created" | "followup">("created");
+  const [pipelineDatePreset, setPipelineDatePreset] = useState<
+    "specific_date" | "today" | "yesterday" | "last_7_days" | "upcoming_7_days" | "all_time" | "custom_range"
+  >("all_time");
+
+  const [pipelineSingleDate, setPipelineSingleDate] = useState<string>(todayStr);
+  const [pipelineStartDate, setPipelineStartDate] = useState<string>(sevenDaysAgoStr);
+  const [pipelineEndDate, setPipelineEndDate] = useState<string>(todayStr);
+
+  // Pipeline Phone Filter Control ("all" | "has_phone" | "no_phone")
+  const [pipelinePhoneFilter, setPipelinePhoneFilter] = useState<"all" | "has_phone" | "no_phone">("all");
+  const [isDeletingLead, setIsDeletingLead] = useState(false);
+
+  // Executive Reschedule Meeting Drawer State
+  const [rescheduleDate, setRescheduleDate] = useState<string>(todayStr);
+  const [rescheduleTime, setRescheduleTime] = useState<string>("10:00 AM");
+  const [sendRescheduleWhatsapp, setSendRescheduleWhatsapp] = useState<boolean>(true);
+  const [isRescheduling, setIsRescheduling] = useState<boolean>(false);
+
+  // Dashboard Leads Tab Date Filter State
+  const [leadsDatePreset, setLeadsDatePreset] = useState<
+    "last_7_days" | "today" | "yesterday" | "specific_date" | "custom_range" | "all_time"
+  >("last_7_days");
+  const [leadsSingleDate, setLeadsSingleDate] = useState<string>(todayStr);
+  const [leadsStartDate, setLeadsStartDate] = useState<string>(sevenDaysAgoStr);
+  const [leadsEndDate, setLeadsEndDate] = useState<string>(todayStr);
+
+  // DYNAMIC PIPELINE STAGES MANAGED STATE
+  const [pipelineStages, setPipelineStages] = useState<PipelineStageConfig[]>(DEFAULT_PIPELINE_STAGES);
+  const [isManagePipelineModalOpen, setIsManagePipelineModalOpen] = useState(false);
+  const [managePipelineTab, setManagePipelineTab] = useState<"active" | "bin">("active");
+
+  const [newStageName, setNewStageName] = useState("");
+  const [newStageColor, setNewStageColor] = useState("#6366f1");
+  const [editingStageId, setEditingStageId] = useState<string | null>(null);
+  const [editingStageName, setEditingStageName] = useState("");
+
+  // Realtime Sync Pipeline Stages from Firebase RTDB `pipeline_stages/firstoptionagency`
+  useEffect(() => {
+    const stagesRef = ref(db, "pipeline_stages/firstoptionagency");
+    const unsubscribe = onValue(stagesRef, (snapshot) => {
+      if (snapshot.exists()) {
+        const data = snapshot.val();
+        if (Array.isArray(data)) {
+          setPipelineStages(data);
+        }
+      } else {
+        setPipelineStages(DEFAULT_PIPELINE_STAGES);
+      }
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  // Filter Active vs Deleted Pipeline Stages
+  const activePipelineStages = pipelineStages.filter((s) => !s.isDeleted);
+  const deletedPipelineStages = pipelineStages.filter((s) => s.isDeleted);
+
+  // Save Pipeline Stages Array to Firebase RTDB
+  const savePipelineStagesToFirebase = async (updatedStages: PipelineStageConfig[]) => {
+    try {
+      const stagesRef = ref(db, "pipeline_stages/firstoptionagency");
+      await set(stagesRef, updatedStages);
+      setPipelineStages(updatedStages);
+    } catch (err) {
+      console.error("Save Pipeline Stages Error:", err);
+    }
+  };
+
+  // Add New Custom Stage
+  const handleAddCustomStage = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newStageName.trim()) return;
+
+    const stageId = `stage_${Date.now()}`;
+    const newStage: PipelineStageConfig = {
+      id: stageId,
+      name: newStageName.trim(),
+      color: newStageColor,
+      bgTag: "bg-indigo-50 text-indigo-700 border-indigo-200",
+      isCompulsory: false,
+      isDeleted: false,
+    };
+
+    const updated = [...pipelineStages];
+    const wonIdx = updated.findIndex((s) => s.id === "won");
+    if (wonIdx !== -1) {
+      updated.splice(wonIdx, 0, newStage);
+    } else {
+      updated.push(newStage);
+    }
+
+    await savePipelineStagesToFirebase(updated);
+    setNewStageName("");
+  };
+
+  // Soft Delete Stage (Move to Recycle Bin)
+  const handleSoftDeleteStage = async (stageId: string) => {
+    const target = pipelineStages.find((s) => s.id === stageId);
+    if (target?.isCompulsory || stageId === "raw" || stageId === "won") {
+      alert("Compulsory Core Stages ('Leads' & 'Won') cannot be deleted or removed!");
+      return;
+    }
+
+    const updated = pipelineStages.map((s) => (s.id === stageId ? { ...s, isDeleted: true } : s));
+    await savePipelineStagesToFirebase(updated);
+  };
+
+  // Restore Soft Deleted Stage from Recycle Bin
+  const handleRestoreSoftDeletedStage = async (stageId: string) => {
+    const updated = pipelineStages.map((s) => (s.id === stageId ? { ...s, isDeleted: false } : s));
+    await savePipelineStagesToFirebase(updated);
+  };
+
+  // Save Renamed Stage
+  const handleSaveRenameStage = async (stageId: string) => {
+    if (!editingStageName.trim()) return;
+    const target = pipelineStages.find((s) => s.id === stageId);
+    if (target?.isCompulsory || stageId === "raw" || stageId === "won") {
+      alert("Compulsory Core Stages ('Leads' & 'Won') cannot be renamed!");
+      return;
+    }
+
+    const updated = pipelineStages.map((s) => (s.id === stageId ? { ...s, name: editingStageName.trim() } : s));
+    await savePipelineStagesToFirebase(updated);
+    setEditingStageId(null);
+    setEditingStageName("");
+  };
+
+  // STAGE AUTOMATION RULES STATE & REALTIME LISTENER
+  const [stageAutomationsMap, setStageAutomationsMap] = useState<Record<string, StageAutomationRule[]>>({});
+  const [activeAutomationStage, setActiveAutomationStage] = useState<PipelineStageConfig | null>(null);
+  const [isStageAutomationModalOpen, setIsStageAutomationModalOpen] = useState(false);
+  const [isAutomationGuideOpen, setIsAutomationGuideOpen] = useState(false);
+  const [showTimingDirectionInfo, setShowTimingDirectionInfo] = useState(false);
+  const [showReferenceBaseInfo, setShowReferenceBaseInfo] = useState(false);
+
+  const [ruleTitle, setRuleTitle] = useState("");
+  const [ruleInstanceName, setRuleInstanceName] = useState("");
+  const [whatsappInstancesList, setWhatsappInstancesList] = useState<any[]>([]);
+  const [ruleTriggerBase, setRuleTriggerBase] = useState<"meeting" | "created">("created");
+  const [ruleOffsetType, setRuleOffsetType] = useState<"before" | "after">("after");
+  const [ruleOffsetValue, setRuleOffsetValue] = useState<number>(1);
+  const [ruleOffsetUnit, setRuleOffsetUnit] = useState<"minutes" | "hours" | "days">("minutes");
+  const [ruleTemplate, setRuleTemplate] = useState("Hello {{name}}, reminder for your strategy session at {{time}} on {{date}}!");
+  const [isSavingRule, setIsSavingRule] = useState(false);
+
+  // PER-LEAD WHATSAPP LOGS MODAL STATE
+  const [selectedLeadForLogs, setSelectedLeadForLogs] = useState<LeadData | null>(null);
+  const [isLeadLogsModalOpen, setIsLeadLogsModalOpen] = useState(false);
+  const [leadLogsList, setLeadLogsList] = useState<any[]>([]);
+  const [isLoadingLeadLogs, setIsLoadingLeadLogs] = useState(false);
+  const [visibleLogsCount, setVisibleLogsCount] = useState<number>(20);
+
+  // DELETE LEAD CONFIRMATION MODAL STATE
+  const [deleteConfirmModalLead, setDeleteConfirmModalLead] = useState<LeadData | null>(null);
+  const [deleteInputText, setDeleteInputText] = useState<string>("");
+
+  const handleOpenLeadLogsModal = (lead: LeadData) => {
+    setSelectedLeadForLogs(lead);
+    setIsLeadLogsModalOpen(true);
+    setIsLoadingLeadLogs(true);
+    setVisibleLogsCount(20); // Reset pagination count to default 20
+
+    const cleanNum = lead.phone ? lead.phone.replace(/\D/g, "") : "";
+    if (cleanNum.length < 5) {
+      setIsLoadingLeadLogs(false);
+      setLeadLogsList([]);
+      return;
+    }
+    const fullCleanNum = cleanNum.length === 10 ? "91" + cleanNum : cleanNum;
+
+    // Sync WhatsApp Logs for this specific lead from Firebase RTDB `whatsapp_lead_logs/${fullCleanNum}`
+    const logsRef = ref(db, `whatsapp_lead_logs/${fullCleanNum}`);
+    onValue(logsRef, (snapshot) => {
+      setIsLoadingLeadLogs(false);
+      if (snapshot.exists()) {
+        const list = Object.values(snapshot.val());
+        list.sort((a: any, b: any) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+        setLeadLogsList(list);
+      } else {
+        setLeadLogsList([]);
+      }
+    });
+  };
+
+  // Sync WhatsApp Instances for Stage Automation Rule Selector
+  useEffect(() => {
+    const instRef = ref(db, "whatsapp_unofficial_instances");
+    const unsubscribe = onValue(instRef, (snapshot) => {
+      if (snapshot.exists()) {
+        const list = Object.values(snapshot.val());
+        setWhatsappInstancesList(list);
+      } else {
+        setWhatsappInstancesList([]);
+      }
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  // Live 1-second Tick State for Realtime Countdown Timer
+  const [nowTick, setNowTick] = useState(Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNowTick(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // Realtime Sync Stage Automations from Firebase RTDB `whatsapp_stage_automations/firstoptionagency`
+  useEffect(() => {
+    const automationsRef = ref(db, "whatsapp_stage_automations/firstoptionagency");
+    const unsubscribe = onValue(automationsRef, (snapshot) => {
+      if (snapshot.exists()) {
+        const data = snapshot.val();
+        const map: Record<string, StageAutomationRule[]> = {};
+        for (const [sId, rulesObj] of Object.entries(data)) {
+          if (rulesObj) {
+            map[sId] = Object.values(rulesObj as Record<string, StageAutomationRule>);
+          }
+        }
+        setStageAutomationsMap(map);
+      } else {
+        setStageAutomationsMap({});
+      }
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  // Realtime Sync Server-side Lead Timers from Firebase RTDB `whatsapp_lead_timers`
+  const [leadTimersMap, setLeadTimersMap] = useState<Record<string, any>>({});
+  useEffect(() => {
+    const timersRef = ref(db, "whatsapp_lead_timers");
+    const unsubscribe = onValue(timersRef, (snapshot) => {
+      if (snapshot.exists()) {
+        setLeadTimersMap(snapshot.val());
+      } else {
+        setLeadTimersMap({});
+      }
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+
+
+  const handleOpenStageAutomationModal = (stage: PipelineStageConfig) => {
+    setActiveAutomationStage(stage);
+    setIsStageAutomationModalOpen(true);
+    setRuleTitle("");
+    const isMeetingStage = stage.id === "meeting_booked";
+    setRuleTriggerBase(isMeetingStage ? "meeting" : "created");
+    setRuleOffsetType(isMeetingStage ? "before" : "after");
+    setRuleOffsetValue(10);
+    setRuleOffsetUnit("minutes");
+    setRuleTemplate(`Hello {{name}}, reminder for your session in stage "${stage.name}" at {{time}} on {{date}}!`);
+  };
+
+  const handleSaveStageRule = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeAutomationStage || !ruleTitle.trim()) return;
+
+    setIsSavingRule(true);
+    try {
+      const ruleId = `rule_${Date.now()}`;
+      const payload = {
+        stageId: activeAutomationStage.id,
+        rule: {
+          id: ruleId,
+          title: ruleTitle.trim(),
+          instanceName: ruleInstanceName,
+          triggerBase: ruleTriggerBase,
+          offsetType: ruleTriggerBase === "created" ? "after" : ruleOffsetType,
+          offsetValue: ruleOffsetValue,
+          offsetUnit: ruleOffsetUnit,
+          template: ruleTemplate,
+          isEnabled: true,
+        },
+      };
+
+      const res = await fetch(`${SERVER_URL}/api/whatsapp/stage-automations`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      const data = await res.json();
+      if (data.success) {
+        setRuleTitle("");
+      } else {
+        alert(`Error saving automation rule: ${data.error}`);
+      }
+    } catch (err: any) {
+      console.error("Save Rule Error:", err);
+    } finally {
+      setIsSavingRule(false);
+    }
+  };
+
+  const handleDeleteStageRule = async (stageId: string, ruleId: string) => {
+    if (!confirm("Are you sure you want to delete this stage automation rule?")) return;
+    try {
+      await fetch(`${SERVER_URL}/api/whatsapp/stage-automations/${stageId}/${ruleId}`, {
+        method: "DELETE",
+      });
+    } catch (err) {
+      console.error("Delete Rule Error:", err);
+    }
+  };
+
+  // Scheduled Meetings Tab Date Filter State
+  const [meetingsDatePreset, setMeetingsDatePreset] = useState<
+    "upcoming_7_days" | "today" | "tomorrow" | "specific_date" | "custom_range" | "all_time"
+  >("upcoming_7_days");
+  const [meetingsSingleDate, setMeetingsSingleDate] = useState<string>(todayStr);
+  const [meetingsStartDate, setMeetingsStartDate] = useState<string>(todayStr);
+  const [meetingsEndDate, setMeetingsEndDate] = useState<string>(sevenDaysAheadStr);
+
+  // Mobile Sidebar State
+  const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
+
+  // Right Drawer State
+  const [selectedLead, setSelectedLead] = useState<LeadData | null>(null);
+  const [isDrawerOpen, setIsDrawerOpen] = useState(false);
+
+  const [newNoteText, setNewNoteText] = useState("");
+  const [followUpDateInput, setFollowUpDateInput] = useState("");
+  const [dealValueInput, setDealValueInput] = useState<string>("");
+  const [isSavingStaffData, setIsSavingStaffData] = useState(false);
+  const [copiedLink, setCopiedLink] = useState<string | null>(null);
+
+  // Day Meetings Modal Popup State
+  const [dayMeetingsModalData, setDayMeetingsModalData] = useState<{
+    dateStr: string;
+    meetings: any[];
+  } | null>(null);
+
+  // Calendar View State
+  const [calYear, setCalYear] = useState<number>(today.getFullYear());
+  const [calMonthIndex, setCalMonthIndex] = useState<number>(today.getMonth());
+  const [calViewMode, setCalViewMode] = useState<"month" | "week">("month");
+
+  // Blocked Slots & Dates Management State
+  const [showBlockSlotsModal, setShowBlockSlotsModal] = useState<boolean>(false);
+  const [blockedSlotsList, setBlockedSlotsList] = useState<Array<{
+    dateStr: string;
+    isFullDateBlocked: boolean;
+    blockedSlots: string[];
+    reason?: string;
+  }>>([]);
+  const [blockMode, setBlockMode] = useState<"range" | "slots">("range");
+  const todayDateStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+  const [blockStartDate, setBlockStartDate] = useState<string>(todayDateStr);
+  const [blockEndDate, setBlockEndDate] = useState<string>(todayDateStr);
+  const [blockSlotDate, setBlockSlotDate] = useState<string>(todayDateStr);
+  const [selectedBlockTimeSlots, setSelectedBlockTimeSlots] = useState<string[]>([]);
+  const [blockReason, setBlockReason] = useState<string>("Marked as booked / Out of office");
+  const [isSubmittingBlock, setIsSubmittingBlock] = useState<boolean>(false);
+
+  const currentActiveCampaign = selectedCampaign !== "all" && selectedCampaign ? selectedCampaign : "firstoptionagency";
+
+  // Fetch list of all blocked dates & slots
+  const fetchBlockedSlotsList = useCallback(async () => {
+    const list = await getAllBlockedSlotsAndDates(currentActiveCampaign);
+    setBlockedSlotsList(list);
+  }, [currentActiveCampaign]);
+
+  useEffect(() => {
+    if (activeTab === "calendar" || activeTab === "meetings" || showBlockSlotsModal) {
+      fetchBlockedSlotsList();
+    }
+  }, [activeTab, showBlockSlotsModal, fetchBlockedSlotsList]);
+
+  // Handlers for slot blocking & unmarking
+  const handleMarkRangeAsBooked = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!blockStartDate || !blockEndDate) {
+      alert("Please select start and end dates.");
+      return;
+    }
+    setIsSubmittingBlock(true);
+    const res = await markDateAsBooked(blockStartDate, blockEndDate, blockReason, currentActiveCampaign);
+    setIsSubmittingBlock(false);
+    if (res.success) {
+      alert(res.message);
+      fetchBlockedSlotsList();
+    } else {
+      alert("Error: " + res.message);
+    }
+  };
+
+  const handleMarkSlotsAsBooked = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!blockSlotDate || selectedBlockTimeSlots.length === 0) {
+      alert("Please select a date and at least one time slot.");
+      return;
+    }
+    setIsSubmittingBlock(true);
+    const res = await markSlotsAsBooked(blockSlotDate, selectedBlockTimeSlots, blockReason, currentActiveCampaign);
+    setIsSubmittingBlock(false);
+    if (res.success) {
+      alert(res.message);
+      fetchBlockedSlotsList();
+      setSelectedBlockTimeSlots([]);
+    } else {
+      alert("Error: " + res.message);
+    }
+  };
+
+  const handleUnmark = async (dateStr: string, timeSlot?: string) => {
+    if (!confirm(`Are you sure you want to unmark ${timeSlot ? timeSlot + ' on ' + dateStr : dateStr}?`)) return;
+    const res = await unmarkDateOrSlot(dateStr, timeSlot, currentActiveCampaign);
+    if (res.success) {
+      fetchBlockedSlotsList();
+    } else {
+      alert("Error: " + res.message);
+    }
+  };
+
+  // Check Auth State & Access Control (Admin Only Access)
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      if (!user) {
+        router.replace("/login?redirect=/crms");
+      } else {
+        setCurrentUser(user);
+        const userData = await syncAndGetUser(user.uid, user.email || "");
+        setCurrentUserData(userData);
+
+        const isAdmin = user.uid === MASTER_ADMIN_UID || userData.roleId === "role_admin" || userData.roleName.toLowerCase() === "admin" || user.email?.toLowerCase().startsWith("firstoption");
+        if (!isAdmin) {
+          setAccessDenied(true);
+        } else {
+          setAccessDenied(false);
+        }
+        setAuthLoading(false);
+      }
+    });
+    return () => unsubscribe();
+  }, [router]);
+
+  // Fetch Dashboard, Pipeline, Calendar, Roles, Users, Tickets
+  const fetchData = useCallback(async () => {
+    if (!currentUser || accessDenied) return;
+    setIsDataLoading(true);
+    try {
+      const [
+        fetchedLeads,
+        fetchedMeetings,
+        fetchedAllMeetings,
+        fetchedAllLeads,
+        fetchedRoles,
+        fetchedUsers,
+        fetchedTickets,
+      ] = await Promise.all([
+        getLeadsForDate(selectedDate, selectedCampaign),
+        getMeetingsForDate(selectedDate, selectedCampaign),
+        getAllMeetings(selectedCampaign),
+        getAllLeadsAcrossDates(selectedCampaign),
+        getRoles(),
+        getAllUsers(),
+        getAllSupportTickets(),
+      ]);
+      setLeadsList(fetchedLeads);
+      setMeetingsList(fetchedMeetings);
+      setAllMeetingsList(fetchedAllMeetings);
+      setAllLeadsList(fetchedAllLeads);
+      setRolesList(fetchedRoles);
+      setUsersList(fetchedUsers);
+      setSupportTickets(fetchedTickets);
+    } catch (err) {
+      console.error("CRM Data Fetch Error:", err);
+    } finally {
+      setIsDataLoading(false);
+    }
+  }, [currentUser, selectedDate, selectedCampaign, accessDenied]);
+
+  const fetchSupportTickets = useCallback(async () => {
+    setIsLoadingTickets(true);
+    try {
+      const data = await getAllSupportTickets();
+      setSupportTickets(data);
+    } catch (err) {
+      console.error("Fetch Support Tickets Error:", err);
+    } finally {
+      setIsLoadingTickets(false);
+    }
+  }, []);
+
+  const handleUpdateTicketStatus = async (ticketId: string, newStatus: SupportTicket["status"]) => {
+    const adminName = currentUserData?.name || currentUser?.displayName || currentUser?.email || "Admin";
+    const success = await updateSupportTicketStatus(ticketId, newStatus, adminName);
+    if (success) {
+      setSupportTickets((prev) =>
+        prev.map((t) => (t.id === ticketId ? { ...t, status: newStatus, resolvedBy: adminName, updatedAt: new Date().toISOString() } : t))
+      );
+    }
+  };
+
+  const handleDeleteTicket = async (ticket: SupportTicket) => {
+    if (!confirm(`Are you sure you want to delete support ticket #${ticket.ticketNumber} (${ticket.subject})?`)) {
+      return;
+    }
+
+    const success = await deleteSupportTicket(ticket.id);
+    if (success) {
+      setSupportTickets((prev) => prev.filter((t) => t.id !== ticket.id));
+    } else {
+      alert("Failed to delete support ticket. Please try again.");
+    }
+  };
+
+  useEffect(() => {
+    if (currentUser && !accessDenied) {
+      fetchData();
+    }
+  }, [currentUser, fetchData, accessDenied]);
+
+  // Handle Logout
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+      router.replace("/login");
+    } catch (err) {
+      console.error("Logout Error:", err);
+    }
+  };
+
+  // Open & Close Drawer Handlers (Normalized across Leads, Pipeline, Meetings, and Calendar)
+  const handleOpenDrawer = (item: LeadData | any) => {
+    if (!item) return;
+
+    // Look up full master lead from allLeadsList to ensure survey, notes, and status are preserved
+    const masterLead = allLeadsList.find((l) =>
+      (item.id && l.id === item.id) ||
+      (item.email && l.email && l.email.toLowerCase() === item.email.toLowerCase())
+    );
+
+    // Normalize meeting object whether clicked from Lead record or Meeting index record
+    const rawMeetingUrl = item.meeting?.meetingUrl || item.meetingUrl || item.links?.meetingUrl || masterLead?.meeting?.meetingUrl || masterLead?.links?.meetingUrl || null;
+    const rawMeetingDate = item.meeting?.meetingDate || item.meetingDate || masterLead?.meeting?.meetingDate || null;
+    const rawMeetingTime = item.meeting?.meetingTime || item.meetingTime || masterLead?.meeting?.meetingTime || null;
+
+    const normalizedMeeting = rawMeetingDate && rawMeetingTime ? {
+      meetingDate: rawMeetingDate,
+      meetingTime: rawMeetingTime,
+      meetingUrl: rawMeetingUrl,
+      bookedAt: item.meeting?.bookedAt || item.bookedAt || masterLead?.meeting?.bookedAt || null,
+      rescheduledAt: item.meeting?.rescheduledAt || masterLead?.meeting?.rescheduledAt || null,
+    } : (item.meeting || masterLead?.meeting || null);
+
+    const fullLeadData: LeadData = {
+      ...(masterLead || {}),
+      ...item,
+      id: item.id || masterLead?.id || (item.email ? sanitizeEmailToId(item.email) : "lead_" + Date.now()),
+      fullName: item.fullName || masterLead?.fullName || "Client",
+      email: item.email || masterLead?.email || "",
+      phone: item.phone || masterLead?.phone || "",
+      meeting: normalizedMeeting,
+      survey: item.survey && Object.keys(item.survey).length > 0 ? item.survey : masterLead?.survey,
+      notes: item.notes || masterLead?.notes || [],
+      followUpDate: item.followUpDate || masterLead?.followUpDate,
+      dealValue: item.dealValue !== undefined ? item.dealValue : masterLead?.dealValue,
+      pipelineStage: item.pipelineStage || masterLead?.pipelineStage || "raw",
+      status: item.status || masterLead?.status || (normalizedMeeting ? "completed" : "partial"),
+    };
+
+    setSelectedLead(fullLeadData);
+    setFollowUpDateInput(fullLeadData.followUpDate || "");
+    setDealValueInput(fullLeadData.dealValue ? fullLeadData.dealValue.toString() : "");
+    setNewNoteText("");
+    setIsDrawerOpen(true);
+  };
+
+  const handleCloseDrawer = () => {
+    setIsDrawerOpen(false);
+    setSelectedLead(null);
+  };
+
+  // Create Role Action
+  const handleCreateNewRole = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setRoleErrorMessage(null);
+    setRoleSuccessMessage(null);
+
+    const cleanName = newRoleName.trim();
+    if (!cleanName) {
+      setRoleErrorMessage("Please enter a role name.");
+      return;
+    }
+
+    if (cleanName.toLowerCase() === "admin") {
+      setRoleErrorMessage("Cannot create 'Admin' role. Admin is a system default role.");
+      return;
+    }
+
+    setIsCreatingRole(true);
+    const res = await createRole(cleanName, newRoleDescription);
+    setIsCreatingRole(false);
+
+    if (res.success && res.role) {
+      setRolesList((prev) => [...prev, res.role!]);
+      setNewRoleName("");
+      setNewRoleDescription("");
+      setRoleSuccessMessage(`Role '${cleanName}' created successfully!`);
+    } else {
+      setRoleErrorMessage(res.message || "Failed to create role.");
+    }
+  };
+
+  // Soft Delete Role Action
+  const handleDeleteRole = async (role: RoleData) => {
+    setRoleErrorMessage(null);
+    setRoleSuccessMessage(null);
+
+    if (role.name.toLowerCase() === "admin" || role.id === "role_admin") {
+      setRoleErrorMessage(`System 'Admin' role cannot be deleted.`);
+      return;
+    }
+
+    const res = await deleteRole(role.id);
+    if (res.success) {
+      setRolesList((prev) => prev.filter((r) => r.id !== role.id));
+      setRoleSuccessMessage(`Role '${role.name}' soft deleted (isDeleted: true).`);
+    } else {
+      setRoleErrorMessage(res.message || "Failed to soft delete role.");
+    }
+  };
+
+  // Manual Email User Registration Handler
+  const handleManualRegisterUserByEmail = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setRoleErrorMessage(null);
+    setRoleSuccessMessage(null);
+
+    const cleanEmail = newRegisterEmail.trim();
+
+    if (!cleanEmail) {
+      setRoleErrorMessage("Please enter a valid User Email address.");
+      return;
+    }
+
+    const targetRoleObj = rolesList.find((r) => r.id === newRegisterRoleId) || { id: "role_onboarding", name: "Onboarding Specialist" };
+    const isMaster = cleanEmail.toLowerCase().startsWith("firstoption");
+
+    if (!isMaster && (targetRoleObj.id === "role_admin" || targetRoleObj.name.toLowerCase() === "admin")) {
+      setRoleErrorMessage("Cannot assign Admin role to non-Master email accounts.");
+      return;
+    }
+
+    setIsRegisteringUser(true);
+    const res = await registerUserByEmail(
+      cleanEmail,
+      targetRoleObj.id,
+      targetRoleObj.name,
+      newRegisterName,
+      newRegisterPhone,
+      newRegisterUid
+    );
+    setIsRegisteringUser(false);
+
+    if (res.success && res.user) {
+      setUsersList((prev) => {
+        const exists = prev.some((u) => u.email.toLowerCase() === cleanEmail.toLowerCase());
+        if (exists) {
+          return prev.map((u) => (u.email.toLowerCase() === cleanEmail.toLowerCase() ? res.user! : u));
+        }
+        return [...prev, res.user!];
+      });
+      setNewRegisterName("");
+      setNewRegisterEmail("");
+      setNewRegisterPhone("");
+      setNewRegisterUid("");
+      setRoleSuccessMessage(`Staff member '${res.user.name || cleanEmail}' registered successfully with '${targetRoleObj.name}' role!`);
+    } else {
+      setRoleErrorMessage(res.message || "Failed to add staff member.");
+    }
+  };
+
+  const handleOpenEditStaffModal = (user: UserData) => {
+    setEditingStaffUser(user);
+    setEditStaffName(user.name || "");
+    setEditStaffPhone(user.phone || "");
+    setEditStaffUid(user.uid || "");
+    setEditStaffRoleId(user.roleId || "role_onboarding");
+  };
+
+  const handleSaveStaffDetails = async () => {
+    if (!editingStaffUser) return;
+    setIsSavingStaffEdit(true);
+    const emailId = editingStaffUser.emailId || sanitizeEmailToId(editingStaffUser.email);
+    const isEditingAdmin = editingStaffUser.email?.toLowerCase().startsWith("firstoption") || editingStaffUser.uid === MASTER_ADMIN_UID || editingStaffUser.roleId === "role_admin" || editingStaffUser.roleName?.toLowerCase() === "admin";
+
+    const targetRoleObj = isEditingAdmin
+      ? { id: "role_admin", name: "Admin" }
+      : rolesList.find((r) => r.id === editStaffRoleId) || { id: editingStaffUser.roleId, name: editingStaffUser.roleName };
+
+    const updatedData: Partial<UserData> = {
+      name: editStaffName.trim(),
+      phone: editStaffPhone.trim(),
+      roleId: targetRoleObj.id,
+      roleName: targetRoleObj.name,
+    };
+
+    if (!isEditingAdmin) {
+      updatedData.uid = editStaffUid.trim();
+    }
+
+    const res = await updateUserStaffDetails(emailId, updatedData);
+    setIsSavingStaffEdit(false);
+
+    if (res.success) {
+      setUsersList((prev) =>
+        prev.map((u) => (u.emailId === emailId || u.email === editingStaffUser.email ? { ...u, ...updatedData } : u))
+      );
+      setRoleSuccessMessage(`Details for '${editStaffName || editingStaffUser.email}' saved!`);
+      setEditingStaffUser(null);
+    } else {
+      setRoleErrorMessage(res.message || "Failed to update user details.");
+    }
+  };
+
+  // Assign / Change User Role Action By Email
+  const handleAssignUserRoleByEmail = async (targetEmail: string, targetRoleId: string) => {
+    setRoleErrorMessage(null);
+    setRoleSuccessMessage(null);
+
+    const targetRoleObj = rolesList.find((r) => r.id === targetRoleId);
+    if (!targetRoleObj) return;
+
+    const isMaster = targetEmail.toLowerCase().startsWith("firstoption");
+
+    if (!isMaster && (targetRoleId === "role_admin" || targetRoleObj.name.toLowerCase() === "admin")) {
+      setRoleErrorMessage("Admin role is strictly reserved for Master Admin accounts. You cannot assign Admin role to other staff emails.");
+      return;
+    }
+
+    const res = await setUserRoleByEmail(targetEmail, targetRoleId, targetRoleObj.name);
+    if (res.success) {
+      setUsersList((prev) =>
+        prev.map((u) => (u.email.toLowerCase() === targetEmail.toLowerCase() ? { ...u, roleId: targetRoleId, roleName: targetRoleObj.name } : u))
+      );
+      setRoleSuccessMessage(`Role for '${targetEmail}' updated to '${targetRoleObj.name}'!`);
+    } else {
+      setRoleErrorMessage(res.message || "Failed to update user role.");
+    }
+  };
+
+  // Staff Action: Update Lead Stage
+  const handleUpdateStage = async (lead: LeadData, newStage: string) => {
+    const targetLeadId = lead.id || (lead.email ? sanitizeEmailToId(lead.email) : "lead_" + Date.now());
+    const targetCreatedDate = lead.createdDate || selectedDate;
+    const targetCampaign = lead.campaign || "firstoptionagency";
+
+    const updatedLead = { ...lead, pipelineStage: newStage, stageMovedAt: new Date().toISOString() };
+    setAllLeadsList((prev) =>
+      prev.map((l) => (l.id === targetLeadId || l.email === lead.email ? updatedLead : l))
+    );
+    setLeadsList((prev) =>
+      prev.map((l) => (l.id === targetLeadId || l.email === lead.email ? updatedLead : l))
+    );
+    if (selectedLead && (selectedLead.id === targetLeadId || selectedLead.email === lead.email)) {
+      setSelectedLead(updatedLead);
+    }
+
+    await updateLeadStaffFields(
+      targetLeadId,
+      targetCreatedDate,
+      { pipelineStage: newStage, stageMovedAt: new Date().toISOString() },
+      targetCampaign
+    );
+  };
+
+  // Open Delete Confirmation Modal
+  const handleDeleteLead = (leadToDelete: LeadData) => {
+    setDeleteConfirmModalLead(leadToDelete);
+    setDeleteInputText("");
+  };
+
+  // Perform Permanent Delete upon typing 'delete' in confirmation modal
+  const handleConfirmDeleteLeadAction = async () => {
+    if (!deleteConfirmModalLead) return;
+    if (deleteInputText.trim().toLowerCase() !== "delete") {
+      alert("Please type 'delete' to confirm deletion.");
+      return;
+    }
+
+    const leadToDelete = deleteConfirmModalLead;
+    const targetLeadId = leadToDelete.id || (leadToDelete.email ? sanitizeEmailToId(leadToDelete.email) : "");
+    if (!targetLeadId) {
+      alert("Cannot delete lead: Lead ID not found.");
+      return;
+    }
+
+    setIsDeletingLead(true);
+    try {
+      const res = await deleteLead(
+        targetLeadId,
+        leadToDelete.createdDate,
+        leadToDelete.campaign || selectedCampaign,
+        leadToDelete.meeting?.meetingDate,
+        leadToDelete.meeting?.meetingTime,
+        leadToDelete.email
+      );
+      if (res.success) {
+        setAllLeadsList((prev) => prev.filter((l) => l.id !== targetLeadId && l.id !== leadToDelete.id));
+        setLeadsList((prev) => prev.filter((l) => l.id !== targetLeadId && l.id !== leadToDelete.id));
+        if (selectedLead && (selectedLead.id === targetLeadId || selectedLead.id === leadToDelete.id)) {
+          setIsDrawerOpen(false);
+          setSelectedLead(null);
+        }
+        setDeleteConfirmModalLead(null);
+        setDeleteInputText("");
+      } else {
+        alert(res.message || "Failed to delete lead from database.");
+      }
+    } catch (err: any) {
+      console.error("handleDeleteLead Error:", err);
+      alert("An unexpected error occurred while deleting the lead.");
+    } finally {
+      setIsDeletingLead(false);
+    }
+  };
+
+  // Staff Action: Update Deal Value (₹)
+  const handleSaveDealValue = async (valStr: string) => {
+    if (!selectedLead) return;
+    const valNum = parseFloat(valStr) || 0;
+    setDealValueInput(valStr);
+    setIsSavingStaffData(true);
+
+    const targetLeadId = selectedLead.id || (selectedLead.email ? sanitizeEmailToId(selectedLead.email) : "lead_" + Date.now());
+    const targetCreatedDate = selectedLead.createdDate || selectedDate;
+    const targetCampaign = selectedLead.campaign || "firstoptionagency";
+
+    const success = await updateLeadStaffFields(
+      targetLeadId,
+      targetCreatedDate,
+      { dealValue: valNum },
+      targetCampaign
+    );
+
+    if (success) {
+      const updatedLead = { ...selectedLead, dealValue: valNum };
+      setSelectedLead(updatedLead);
+      setAllLeadsList((prev) =>
+        prev.map((l) => (l.id === targetLeadId || l.email === selectedLead.email ? updatedLead : l))
+      );
+      setLeadsList((prev) =>
+        prev.map((l) => (l.id === targetLeadId || l.email === selectedLead.email ? updatedLead : l))
+      );
+    }
+    setIsSavingStaffData(false);
+  };
+
+  // Staff Action: Add note
+  const handleAddNote = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedLead || !newNoteText.trim()) return;
+
+    setIsSavingStaffData(true);
+
+    const targetLeadId = selectedLead.id || (selectedLead.email ? sanitizeEmailToId(selectedLead.email) : "lead_" + Date.now());
+    const targetCreatedDate = selectedLead.createdDate || selectedDate;
+    const targetCampaign = selectedLead.campaign || "firstoptionagency";
+
+    const newNoteObj: StaffNote = {
+      id: "note_" + Date.now(),
+      text: newNoteText.trim(),
+      createdAt: new Date().toISOString(),
+      author: currentUser?.email ? currentUser.email.split("@")[0] : "Staff",
+    };
+
+    const updatedNotes = [...(selectedLead.notes || []), newNoteObj];
+
+    const success = await updateLeadStaffFields(
+      targetLeadId,
+      targetCreatedDate,
+      { notes: updatedNotes, followUpDate: followUpDateInput || selectedLead.followUpDate },
+      targetCampaign
+    );
+
+    if (success) {
+      const updatedLead = {
+        ...selectedLead,
+        notes: updatedNotes,
+        followUpDate: followUpDateInput || selectedLead.followUpDate,
+      };
+      setSelectedLead(updatedLead);
+      setLeadsList((prev) =>
+        prev.map((l) => ((l.id === targetLeadId || l.email === selectedLead.email) ? updatedLead : l))
+      );
+      setAllLeadsList((prev) =>
+        prev.map((l) => ((l.id === targetLeadId || l.email === selectedLead.email) ? updatedLead : l))
+      );
+      setMeetingsList((prev) =>
+        prev.map((m) =>
+          (m.leadId === targetLeadId || m.email === selectedLead.email)
+            ? { ...m, notes: updatedNotes, followUpDate: updatedLead.followUpDate }
+            : m
+        )
+      );
+      setAllMeetingsList((prev) =>
+        prev.map((m) =>
+          (m.leadId === targetLeadId || m.email === selectedLead.email)
+            ? { ...m, notes: updatedNotes, followUpDate: updatedLead.followUpDate }
+            : m
+        )
+      );
+      setNewNoteText("");
+    }
+    setIsSavingStaffData(false);
+  };
+
+  // Staff Action: Save Follow-up Date
+  const handleSaveFollowUpDate = async (dateVal: string) => {
+    if (!selectedLead) return;
+    setFollowUpDateInput(dateVal);
+    setIsSavingStaffData(true);
+
+    const targetLeadId = selectedLead.id || (selectedLead.email ? sanitizeEmailToId(selectedLead.email) : "lead_" + Date.now());
+    const targetCreatedDate = selectedLead.createdDate || selectedDate;
+    const targetCampaign = selectedLead.campaign || "firstoptionagency";
+
+    const success = await updateLeadStaffFields(
+      targetLeadId,
+      targetCreatedDate,
+      { notes: selectedLead.notes || [], followUpDate: dateVal },
+      targetCampaign
+    );
+
+    if (success) {
+      const updatedLead = { ...selectedLead, followUpDate: dateVal };
+      setSelectedLead(updatedLead);
+      setLeadsList((prev) =>
+        prev.map((l) => ((l.id === targetLeadId || l.email === selectedLead.email) ? updatedLead : l))
+      );
+      setAllLeadsList((prev) =>
+        prev.map((l) => ((l.id === targetLeadId || l.email === selectedLead.email) ? updatedLead : l))
+      );
+      setMeetingsList((prev) =>
+        prev.map((m) =>
+          (m.leadId === targetLeadId || m.email === selectedLead.email)
+            ? { ...m, followUpDate: dateVal }
+            : m
+        )
+      );
+      setAllMeetingsList((prev) =>
+        prev.map((m) =>
+          (m.leadId === targetLeadId || m.email === selectedLead.email)
+            ? { ...m, followUpDate: dateVal }
+            : m
+        )
+      );
+    }
+    setIsSavingStaffData(false);
+  };
+
+  // Copy helper for links
+  const handleCopyLink = (url: string, label: string) => {
+    navigator.clipboard.writeText(url);
+    setCopiedLink(label);
+    setTimeout(() => setCopiedLink(null), 2000);
+  };
+
+  // Filtered Leads
+  const filteredLeads = allLeadsList.filter((lead) => {
+    if (selectedCampaign !== "all" && lead.campaign !== selectedCampaign) return false;
+
+    const createdDateStr = lead.createdDate;
+    if (leadsDatePreset !== "all_time") {
+      if (!createdDateStr) return false;
+      const cleanDate = createdDateStr.split("T")[0];
+
+      if (leadsDatePreset === "specific_date") {
+        if (cleanDate !== leadsSingleDate) return false;
+      } else if (leadsDatePreset === "custom_range") {
+        if (leadsStartDate && cleanDate < leadsStartDate) return false;
+        if (leadsEndDate && cleanDate > leadsEndDate) return false;
+      } else if (leadsDatePreset === "today") {
+        if (cleanDate !== todayStr) return false;
+      } else if (leadsDatePreset === "yesterday") {
+        const yestObj = new Date(today);
+        yestObj.setDate(yestObj.getDate() - 1);
+        const yestStr = yestObj.toISOString().split("T")[0];
+        if (cleanDate !== yestStr) return false;
+      } else if (leadsDatePreset === "last_7_days") {
+        const d7AgoObj = new Date(today);
+        d7AgoObj.setDate(d7AgoObj.getDate() - 7);
+        const d7AgoStr = d7AgoObj.toISOString().split("T")[0];
+        if (cleanDate < d7AgoStr || cleanDate > todayStr) return false;
+      }
+    }
+
+    const matchesSearch =
+      (lead.fullName || "").toLowerCase().includes(searchQuery.toLowerCase()) ||
+      (lead.phone || "").includes(searchQuery) ||
+      (lead.email || "").toLowerCase().includes(searchQuery.toLowerCase());
+
+    const matchesStatus = statusFilter === "all" ? true : lead.status === statusFilter;
+
+    return matchesSearch && matchesStatus;
+  });
+
+  // Filtered Meetings
+  const filteredMeetings = allMeetingsList.filter((m) => {
+    if (selectedCampaign !== "all" && m.campaign !== selectedCampaign) return false;
+
+    const meetingDateStr = m.meetingDate;
+    if (meetingsDatePreset !== "all_time") {
+      if (!meetingDateStr) return false;
+      const cleanDate = meetingDateStr.split("T")[0];
+
+      if (meetingsDatePreset === "specific_date") {
+        if (cleanDate !== meetingsSingleDate) return false;
+      } else if (meetingsDatePreset === "custom_range") {
+        if (meetingsStartDate && cleanDate < meetingsStartDate) return false;
+        if (meetingsEndDate && cleanDate > meetingsEndDate) return false;
+      } else if (meetingsDatePreset === "today") {
+        if (cleanDate !== todayStr) return false;
+      } else if (meetingsDatePreset === "tomorrow") {
+        const tomObj = new Date(today);
+        tomObj.setDate(tomObj.getDate() + 1);
+        const tomStr = tomObj.toISOString().split("T")[0];
+        if (cleanDate !== tomStr) return false;
+      } else if (meetingsDatePreset === "upcoming_7_days") {
+        const d7AheadObj = new Date(today);
+        d7AheadObj.setDate(d7AheadObj.getDate() + 7);
+        const d7AheadStr = d7AheadObj.toISOString().split("T")[0];
+        if (cleanDate < todayStr || cleanDate > d7AheadStr) return false;
+      }
+    }
+
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase();
+      const matchesSearch =
+        (m.fullName || "").toLowerCase().includes(q) ||
+        (m.phone || "").includes(q) ||
+        (m.email || "").toLowerCase().includes(q);
+      if (!matchesSearch) return false;
+    }
+
+    return true;
+  });
+
+  // Filtered Pipeline Leads
+  const filteredPipelineLeads = allLeadsList.filter((lead) => {
+    if (selectedCampaign !== "all" && lead.campaign && lead.campaign !== selectedCampaign) return false;
+
+    let targetDateStr: string | undefined = undefined;
+    if (pipelineTargetField === "meeting") {
+      targetDateStr = lead.meeting?.meetingDate || lead.createdDate;
+    } else if (pipelineTargetField === "created") {
+      targetDateStr = lead.createdDate || (lead as any).createdAt || (lead as any).stageMovedAt;
+    } else if (pipelineTargetField === "followup") {
+      targetDateStr = lead.followUpDate || lead.createdDate;
+    }
+
+    if (pipelineDatePreset !== "all_time" && targetDateStr) {
+      const cleanTargetDate = targetDateStr.split("T")[0];
+
+      if (pipelineDatePreset === "specific_date") {
+        if (cleanTargetDate !== pipelineSingleDate) return false;
+      } else if (pipelineDatePreset === "custom_range") {
+        if (pipelineStartDate && cleanTargetDate < pipelineStartDate) return false;
+        if (pipelineEndDate && cleanTargetDate > pipelineEndDate) return false;
+      } else if (pipelineDatePreset === "today") {
+        if (cleanTargetDate !== todayStr) return false;
+      } else if (pipelineDatePreset === "yesterday") {
+        const yestObj = new Date(today);
+        yestObj.setDate(yestObj.getDate() - 1);
+        const yestStr = yestObj.toISOString().split("T")[0];
+        if (cleanTargetDate !== yestStr) return false;
+      } else if (pipelineDatePreset === "last_7_days") {
+        const d7AgoObj = new Date(today);
+        d7AgoObj.setDate(d7AgoObj.getDate() - 7);
+        const d7AgoStr = d7AgoObj.toISOString().split("T")[0];
+        if (cleanTargetDate < d7AgoStr || cleanTargetDate > todayStr) return false;
+      } else if (pipelineDatePreset === "upcoming_7_days") {
+        const d7AheadObj = new Date(today);
+        d7AheadObj.setDate(d7AheadObj.getDate() + 7);
+        const d7AheadStr = d7AheadObj.toISOString().split("T")[0];
+        if (cleanTargetDate < todayStr || cleanTargetDate > d7AheadStr) return false;
+      }
+    }
+
+    if (pipelinePhoneFilter === "has_phone") {
+      const cleanP = (lead.phone || "").replace(/\D/g, "");
+      if (cleanP.length < 5) return false;
+    } else if (pipelinePhoneFilter === "no_phone") {
+      const cleanP = (lead.phone || "").replace(/\D/g, "");
+      if (cleanP.length >= 5) return false;
+    }
+
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase();
+      const nameMatch = (lead.fullName || "").toLowerCase().includes(q);
+      const emailMatch = (lead.email || "").toLowerCase().includes(q);
+      const phoneMatch = (lead.phone || "").includes(q);
+      if (!nameMatch && !emailMatch && !phoneMatch) return false;
+    }
+
+    return true;
+  });
+
+  // Calculate Metrics
+  const totalLeadsCount = filteredLeads.length;
+  const partialLeadsCount = filteredLeads.filter((l) => l.status === "partial").length;
+  const surveyCompletedCount = filteredLeads.filter(
+    (l) => l.status === "survey_completed" || l.status === "completed" || (l.survey && Object.keys(l.survey).length > 0)
+  ).length;
+  const bookedMeetingsCount = filteredLeads.filter(
+    (l) => l.status === "completed" || !!l.meeting?.meetingDate
+  ).length;
+  const todayMeetingsScheduled = filteredMeetings.length;
+
+  const surveyPct = totalLeadsCount > 0 ? Math.round((surveyCompletedCount / totalLeadsCount) * 100) : 0;
+  const bookedPct = totalLeadsCount > 0 ? Math.round((bookedMeetingsCount / totalLeadsCount) * 100) : 0;
+
+  // CALENDAR NAVIGATION HELPERS
+  const handlePrevCalMonth = () => {
+    if (calMonthIndex > 0) {
+      setCalMonthIndex(calMonthIndex - 1);
+    } else {
+      setCalMonthIndex(11);
+      setCalYear(calYear - 1);
+    }
+  };
+
+  const handleNextCalMonth = () => {
+    if (calMonthIndex < 11) {
+      setCalMonthIndex(calMonthIndex + 1);
+    } else {
+      setCalMonthIndex(0);
+      setCalYear(calYear + 1);
+    }
+  };
+
+  const handleTodayCalMonth = () => {
+    const now = new Date();
+    setCalYear(now.getFullYear());
+    setCalMonthIndex(now.getMonth());
+  };
+
+  // Build Calendar Matrix
+  const daysInCalMonth = new Date(calYear, calMonthIndex + 1, 0).getDate();
+  const firstDayOfWeek = new Date(calYear, calMonthIndex, 1).getDay();
+  const prevMonthLastDay = new Date(calYear, calMonthIndex, 0).getDate();
+
+  const calGridCells: Array<{
+    dayNum: number;
+    monthOffset: -1 | 0 | 1;
+    dateStr: string;
+    isToday: boolean;
+  }> = [];
+
+  for (let i = firstDayOfWeek - 1; i >= 0; i--) {
+    const dNum = prevMonthLastDay - i;
+    const pMonthIndex = calMonthIndex === 0 ? 11 : calMonthIndex - 1;
+    const pYear = calMonthIndex === 0 ? calYear - 1 : calYear;
+    const mStr = (pMonthIndex + 1).toString().padStart(2, "0");
+    const dStr = dNum.toString().padStart(2, "0");
+    const dateStr = `${pYear}-${mStr}-${dStr}`;
+
+    calGridCells.push({
+      dayNum: dNum,
+      monthOffset: -1,
+      dateStr,
+      isToday: dateStr === todayStr,
+    });
+  }
+
+  for (let d = 1; d <= daysInCalMonth; d++) {
+    const mStr = (calMonthIndex + 1).toString().padStart(2, "0");
+    const dStr = d.toString().padStart(2, "0");
+    const dateStr = `${calYear}-${mStr}-${dStr}`;
+
+    calGridCells.push({
+      dayNum: d,
+      monthOffset: 0,
+      dateStr,
+      isToday: dateStr === todayStr,
+    });
+  }
+
+  const remainingCells = 35 - calGridCells.length > 0 ? 35 - calGridCells.length : (42 - calGridCells.length > 0 ? 42 - calGridCells.length : 0);
+  for (let n = 1; n <= remainingCells; n++) {
+    const nMonthIndex = calMonthIndex === 11 ? 0 : calMonthIndex + 1;
+    const nYear = calMonthIndex === 11 ? calYear + 1 : calYear;
+    const mStr = (nMonthIndex + 1).toString().padStart(2, "0");
+    const dStr = n.toString().padStart(2, "0");
+    const dateStr = `${nYear}-${mStr}-${dStr}`;
+
+    calGridCells.push({
+      dayNum: n,
+      monthOffset: 1,
+      dateStr,
+      isToday: dateStr === todayStr,
+    });
+  }
+
+  const meetingsByDateMap: Record<string, any[]> = {};
+  allMeetingsList.forEach((m) => {
+    if (m.meetingDate) {
+      if (!meetingsByDateMap[m.meetingDate]) {
+        meetingsByDateMap[m.meetingDate] = [];
+      }
+      meetingsByDateMap[m.meetingDate].push(m);
+    }
+  });
+
+  if (authLoading) {
+    return (
+      <div className="w-full min-h-screen bg-[#F5F6F8] flex items-center justify-center font-sans">
+        <div className="flex items-center space-x-3 text-indigo-600 font-bold text-sm">
+          <i className="fa-solid fa-circle-notch fa-spin text-2xl"></i>
+          <span>Authenticating Admin Credentials...</span>
+        </div>
+      </div>
+    );
+  }
+
+  // ACCESS DENIED SCREEN FOR NON-ADMIN USERS
+  if (accessDenied) {
+    return (
+      <div className="w-full min-h-screen bg-[#F5F6F8] flex items-center justify-center font-sans p-4">
+        <div className="max-w-md w-full bg-white rounded-3xl p-6 sm:p-8 border border-slate-200 shadow-xl text-center space-y-4">
+          <div className="w-14 h-14 bg-rose-100 border border-rose-200 rounded-2xl flex items-center justify-center text-2xl text-rose-600 mx-auto shadow-2xs">
+            <i className="fa-solid fa-lock"></i>
+          </div>
+          <div>
+            <h2 className="text-xl font-extrabold text-slate-900">
+              Access Denied: Admin Required
+            </h2>
+            <p className="text-xs text-slate-500 mt-1 font-medium leading-relaxed">
+              Only users with the <strong className="text-indigo-600">Admin Role</strong> or Master Admin ID (<code className="font-mono bg-slate-100 px-1 rounded">{MASTER_ADMIN_UID}</code>) have permission to manage CRM pages.
+            </p>
+          </div>
+
+          <div className="bg-slate-50 border border-slate-200 rounded-2xl p-3 text-left text-xs space-y-1 font-mono">
+            <p className="text-slate-400">Your Email: <span className="text-slate-800 font-bold">{currentUser?.email}</span></p>
+            <p className="text-slate-400">Assigned Role: <span className="text-rose-600 font-bold">{currentUserData?.roleName || "Standard Staff"}</span></p>
+          </div>
+
+          <div className="flex items-center space-x-2 pt-2">
+            <button
+              onClick={() => router.push("/management")}
+              className="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold text-xs py-2.5 rounded-xl transition-all shadow-sm flex items-center justify-center space-x-1.5"
+            >
+              <i className="fa-solid fa-users-gear text-xs"></i>
+              <span>Go to Team Workspace</span>
+            </button>
+
+            <button
+              onClick={handleLogout}
+              className="flex-1 bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold text-xs py-2.5 rounded-xl transition-all border border-slate-200"
+            >
+              <span>Logout</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="w-full min-h-screen bg-[#F5F6F8] text-slate-900 font-sans flex flex-col md:flex-row antialiased relative">
+      {/* Mobile Sidebar Overlay */}
+      {isMobileSidebarOpen && (
+        <div
+          onClick={() => setIsMobileSidebarOpen(false)}
+          className="fixed inset-0 bg-black/50 z-40 md:hidden"
+        />
+      )}
+
+      {/* Sidebar Navigation */}
+      <aside
+        className={`fixed md:static inset-y-0 left-0 z-40 w-64 bg-white border-r border-slate-200 flex flex-col justify-between p-4 transition-transform duration-200 transform ${
+          isMobileSidebarOpen ? "translate-x-0" : "-translate-x-full md:translate-x-0"
+        }`}
+      >
+        <div className="space-y-6">
+          {/* Logo */}
+          <div className="flex items-center space-x-3 px-2">
+            <div className="w-9 h-9 rounded-xl bg-indigo-600 text-white flex items-center justify-center font-black text-xs shadow">
+              FOA
+            </div>
+            <div>
+              <h2 className="text-sm font-bold text-slate-900 leading-tight">
+                First Option Agency
+                <center>
+                CRM
+                </center>
+              </h2>
+              <span className="text-[10px] text-indigo-600 font-semibold uppercase tracking-wider">
+                Executive Portal
+              </span>
+            </div>
+          </div>
+
+          {/* Navigation Items (Syncs Route Query ?tab=...) */}
+          <nav className="space-y-4">
+            {/* SECTION 1: CRM WORKSPACE */}
+            <div className="space-y-1">
+              <div className="px-3 pb-1 text-[10px] font-extrabold text-slate-400 uppercase tracking-wider">
+                CRM Workspace
+              </div>
+
+              <button
+                onClick={() => {
+                  changeTab("pipeline");
+                  setIsMobileSidebarOpen(false);
+                }}
+                className={`w-full flex items-center space-x-3 px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all ${
+                  activeTab === "pipeline"
+                    ? "bg-indigo-50 text-indigo-700 shadow-2xs font-extrabold border-l-4 border-indigo-600"
+                    : "text-slate-600 hover:bg-slate-50 hover:text-slate-900"
+                }`}
+              >
+                <i className="fa-solid fa-columns text-sm text-indigo-600"></i>
+                <span>Pipeline Stage Board</span>
+              </button>
+
+              <button
+                onClick={() => {
+                  changeTab("leads");
+                  setIsMobileSidebarOpen(false);
+                }}
+                className={`w-full flex items-center space-x-3 px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all ${
+                  activeTab === "leads"
+                    ? "bg-indigo-50 text-indigo-700 shadow-2xs font-extrabold border-l-4 border-indigo-600"
+                    : "text-slate-600 hover:bg-slate-50 hover:text-slate-900"
+                }`}
+              >
+                <i className="fa-solid fa-chart-line text-sm text-indigo-600"></i>
+                <span>Dashboard & Leads</span>
+              </button>
+
+              <button
+                onClick={() => {
+                  changeTab("meetings");
+                  setIsMobileSidebarOpen(false);
+                }}
+                className={`w-full flex items-center space-x-3 px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all ${
+                  activeTab === "meetings"
+                    ? "bg-indigo-50 text-indigo-700 shadow-2xs font-extrabold border-l-4 border-indigo-600"
+                    : "text-slate-600 hover:bg-slate-50 hover:text-slate-900"
+                }`}
+              >
+                <i className="fa-solid fa-calendar-check text-sm text-indigo-600"></i>
+                <span>Scheduled Meetings</span>
+              </button>
+
+              <button
+                onClick={() => {
+                  changeTab("calendar");
+                  setIsMobileSidebarOpen(false);
+                }}
+                className={`w-full flex items-center space-x-3 px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all ${
+                  activeTab === "calendar"
+                    ? "bg-indigo-50 text-indigo-700 shadow-2xs font-extrabold border-l-4 border-indigo-600"
+                    : "text-slate-600 hover:bg-slate-50 hover:text-slate-900"
+                }`}
+              >
+                <i className="fa-solid fa-calendar-days text-sm text-indigo-600"></i>
+                <span>Meetings Calendar</span>
+              </button>
+            </div>
+          </nav>
+        </div>
+
+        {/* User Footer & Logout */}
+        <div className="border-t border-slate-100 pt-3 space-y-2">
+          <div className="flex items-center space-x-2.5 px-2">
+            <div className="w-8 h-8 rounded-full bg-slate-100 border border-slate-200 flex items-center justify-center text-xs font-bold text-slate-700">
+              {currentUser?.email?.charAt(0).toUpperCase() || "A"}
+            </div>
+            <div className="truncate text-left">
+              <p className="text-xs font-bold text-slate-900 truncate flex items-center space-x-1">
+                <span>{currentUserData?.roleName || "Admin"}</span>
+                {(currentUser?.uid === MASTER_ADMIN_UID || currentUser?.email?.toLowerCase().startsWith("firstoption")) && (
+                  <span className="text-[9px] bg-indigo-100 text-indigo-800 font-extrabold px-1 rounded">
+                    👑 Master
+                  </span>
+                )}
+              </p>
+              <p className="text-[10px] text-slate-400 truncate">
+                {currentUser?.email}
+              </p>
+            </div>
+          </div>
+
+          <button
+            onClick={handleLogout}
+            className="w-full flex items-center justify-center space-x-2 text-xs font-bold text-red-600 hover:bg-red-50 py-2 rounded-xl transition-colors"
+          >
+            <i className="fa-solid fa-arrow-right-from-bracket"></i>
+            <span>Log Out</span>
+          </button>
+        </div>
+      </aside>
+
+      {/* Main Content Area */}
+      <div className="flex-1 flex flex-col min-w-0 bg-[#F5F6F8]">
+        {/* Responsive Header */}
+        <header className="bg-white border-b border-slate-200 px-3 py-2.5 sm:px-6 flex flex-col sm:flex-row sm:items-center justify-between sticky top-0 z-30 shadow-sm gap-2">
+          <div className="flex items-center justify-between w-full sm:w-auto">
+            <div className="flex items-center space-x-2.5">
+              <button
+                onClick={() => setIsMobileSidebarOpen(true)}
+                className="w-8 h-8 rounded-lg border border-slate-200 text-slate-600 flex items-center justify-center md:hidden"
+              >
+                <i className="fa-solid fa-bars"></i>
+              </button>
+
+              <div>
+                <h1 className="text-sm sm:text-lg font-bold text-slate-900">
+                  {activeTab === "pipeline"
+                    ? "Kanban Pipeline Board"
+                    : activeTab === "roles"
+                    ? "Roles & Staff Directory"
+                    : activeTab === "calendar"
+                    ? "Meetings Calendar"
+                    : activeTab === "tickets"
+                    ? "Client Support Tickets"
+                    : "Executive CRM"}
+                </h1>
+                <p className="text-[10px] sm:text-[11px] text-slate-500 hidden sm:block">
+                  {activeTab === "pipeline"
+                    ? "Drag-and-drop lead stage management with deal value tracking & date filters"
+                    : activeTab === "roles"
+                    ? "Manage staff directory, roles, and permissions across the CRM system"
+                    : activeTab === "calendar"
+                    ? "Interactive visual calendar dashboard for managing all client appointments"
+                    : activeTab === "tickets"
+                    ? "Manage client support tickets and resolution workflow"
+                    : "Real-time tracking of leads, survey qualifications, and booked strategy meetings"}
+                </p>
+              </div>
+            </div>
+
+            <button
+              onClick={fetchData}
+              disabled={isDataLoading}
+              className="w-8 h-8 rounded-xl bg-indigo-50 border border-indigo-200 text-indigo-600 text-xs font-bold hover:bg-indigo-100 flex items-center justify-center sm:hidden"
+            >
+              <i className={`fa-solid fa-rotate-right ${isDataLoading ? "fa-spin" : ""}`}></i>
+            </button>
+          </div>
+
+          <div className="flex items-center space-x-2 w-full sm:w-auto overflow-x-auto pb-1 sm:pb-0">
+            <select
+              value={selectedCampaign}
+              onChange={(e) => setSelectedCampaign(e.target.value)}
+              className="bg-white border border-slate-300 rounded-xl px-2 py-1 sm:px-2.5 sm:py-1.5 text-xs text-slate-800 font-semibold focus:outline-none focus:border-indigo-600 flex-1 sm:flex-none"
+            >
+              <option value="all">All Campaigns</option>
+              {Object.keys(CAMPAIGNS).map((key) => (
+                <option key={key} value={key}>
+                  {CAMPAIGNS[key].title}
+                </option>
+              ))}
+            </select>
+
+            <button
+              onClick={fetchData}
+              disabled={isDataLoading}
+              className="hidden sm:flex px-3 py-1.5 rounded-xl bg-indigo-50 border border-indigo-200 text-indigo-600 text-xs font-bold hover:bg-indigo-100 items-center justify-center space-x-1.5 transition-colors"
+            >
+              <i className={`fa-solid fa-rotate-right ${isDataLoading ? "fa-spin" : ""}`}></i>
+              <span>Refresh</span>
+            </button>
+          </div>
+        </header>
+
+        {/* Dashboard Body */}
+        <main className="p-3 sm:p-6 space-y-4 sm:space-y-6 w-full max-w-full">
+          {/* DEDICATED TAB: ROLES & STAFF DIRECTORY */}
+          {activeTab === "roles" ? (
+            <div className="space-y-5 font-sans">
+              {/* Header Info Card */}
+              <div className="bg-white border border-slate-200 rounded-2xl sm:rounded-3xl p-5 shadow-sm space-y-2 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div className="flex items-center space-x-3">
+                  <div className="w-10 h-10 rounded-2xl bg-indigo-50 border border-indigo-200 flex items-center justify-center text-lg text-indigo-600 shadow-2xs flex-shrink-0">
+                    <i className="fa-solid fa-users-gear"></i>
+                  </div>
+                  <div>
+                    <h2 className="text-base sm:text-lg font-extrabold text-slate-900">
+                      Roles & Staff Directory
+                    </h2>
+                    <p className="text-xs text-slate-500 font-medium">
+                      Manage staff directory, roles, and permissions across the CRM system.
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              {/* Toast Feedback Messages */}
+              {roleErrorMessage && (
+                <div className="bg-rose-50 border border-rose-200 text-rose-800 p-4 rounded-2xl text-xs font-bold flex items-center justify-between shadow-2xs">
+                  <div className="flex items-center space-x-2">
+                    <i className="fa-solid fa-triangle-exclamation text-rose-600 text-sm"></i>
+                    <span>{roleErrorMessage}</span>
+                  </div>
+                  <button
+                    onClick={() => setRoleErrorMessage(null)}
+                    className="text-rose-500 hover:text-rose-800 text-xs font-bold"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              )}
+
+              {roleSuccessMessage && (
+                <div className="bg-emerald-50 border border-emerald-200 text-emerald-800 p-4 rounded-2xl text-xs font-bold flex items-center justify-between shadow-2xs">
+                  <div className="flex items-center space-x-2">
+                    <i className="fa-solid fa-circle-check text-emerald-600 text-sm"></i>
+                    <span>{roleSuccessMessage}</span>
+                  </div>
+                  <button
+                    onClick={() => setRoleSuccessMessage(null)}
+                    className="text-emerald-600 hover:text-emerald-800 text-xs font-bold"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              )}
+
+              {/* 1. AUTH USER MANAGEMENT & STAFF ROLES */}
+              <div className="bg-white border border-slate-200 rounded-2xl sm:rounded-3xl p-5 shadow-sm space-y-4">
+                <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+                  <div>
+                    <h3 className="text-sm font-extrabold text-slate-900 flex items-center space-x-2">
+                      <i className="fa-solid fa-user-shield text-indigo-600"></i>
+                      <span>Staff Directory & Assigned Roles ({usersList.length})</span>
+                    </h3>
+                    <p className="text-xs text-slate-400">
+                      Register staff with Name, Email, WhatsApp Phone & Role.
+                    </p>
+                  </div>
+                  <span className="text-xs font-mono font-bold bg-indigo-50 text-indigo-700 px-2.5 py-1 rounded-xl border border-indigo-200">
+                    /users
+                  </span>
+                </div>
+
+                {/* Form to Register Staff Member */}
+                <form onSubmit={handleManualRegisterUserByEmail} className="space-y-3 bg-slate-50 p-4 rounded-2xl border border-slate-200">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                    <div className="space-y-1">
+                      <label className="text-xs font-bold text-slate-700">Staff Member Name *</label>
+                      <input
+                        type="text"
+                        placeholder="e.g. Rahul Sharma"
+                        value={newRegisterName}
+                        onChange={(e) => setNewRegisterName(e.target.value)}
+                        className="w-full bg-white border border-slate-300 rounded-xl px-3 py-2 text-xs font-bold text-slate-900 focus:outline-none focus:border-indigo-600"
+                        required
+                      />
+                    </div>
+
+                    <div className="space-y-1">
+                      <label className="text-xs font-bold text-slate-700">User Email Address *</label>
+                      <input
+                        type="email"
+                        placeholder="e.g. staff@firstoptionagency.com"
+                        value={newRegisterEmail}
+                        onChange={(e) => setNewRegisterEmail(e.target.value)}
+                        className="w-full bg-white border border-slate-300 rounded-xl px-3 py-2 text-xs font-bold text-slate-900 focus:outline-none focus:border-indigo-600"
+                        required
+                      />
+                    </div>
+
+                    <div className="space-y-1">
+                      <label className="text-xs font-bold text-slate-700">WhatsApp Number *</label>
+                      <input
+                        type="tel"
+                        placeholder="e.g. +919876543210"
+                        value={newRegisterPhone}
+                        onChange={(e) => setNewRegisterPhone(e.target.value)}
+                        className="w-full bg-white border border-slate-300 rounded-xl px-3 py-2 text-xs font-bold text-slate-900 focus:outline-none focus:border-indigo-600"
+                        required
+                      />
+                    </div>
+
+                    <div className="space-y-1">
+                      <label className="text-xs font-bold text-slate-700">Staff UID (Optional)</label>
+                      <input
+                        type="text"
+                        placeholder="e.g. usr_10293"
+                        value={newRegisterUid}
+                        onChange={(e) => setNewRegisterUid(e.target.value)}
+                        className="w-full bg-white border border-slate-300 rounded-xl px-3 py-2 text-xs font-bold text-slate-900 focus:outline-none focus:border-indigo-600"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 pt-1">
+                    <div className="sm:w-1/2 space-y-1">
+                      <label className="text-xs font-bold text-slate-700">Assign Staff Role *</label>
+                      <select
+                        value={newRegisterRoleId}
+                        onChange={(e) => setNewRegisterRoleId(e.target.value)}
+                        className="w-full bg-white border border-slate-300 rounded-xl px-3 py-2 text-xs font-bold text-slate-900 focus:outline-none focus:border-indigo-600"
+                      >
+                        {rolesList
+                          .filter((r) => r.id !== "role_admin" && r.name.toLowerCase() !== "admin")
+                          .map((r) => (
+                            <option key={r.id} value={r.id}>
+                              {r.name}
+                            </option>
+                          ))}
+                      </select>
+                    </div>
+
+                    <div className="sm:w-1/2 flex items-end">
+                      <button
+                        type="submit"
+                        disabled={isRegisteringUser || !newRegisterEmail.trim()}
+                        className="w-full bg-gradient-to-r from-indigo-600 to-blue-600 hover:from-indigo-700 hover:to-blue-700 text-white text-xs font-extrabold py-2 px-4 rounded-xl shadow-sm transition-all flex items-center justify-center space-x-2 disabled:opacity-50 cursor-pointer"
+                      >
+                        {isRegisteringUser ? (
+                          <i className="fa-solid fa-circle-notch fa-spin text-xs"></i>
+                        ) : (
+                          <i className="fa-solid fa-user-check text-xs"></i>
+                        )}
+                        <span>Add Staff Member & Assign Role 👤</span>
+                      </button>
+                    </div>
+                  </div>
+                </form>
+
+                <div className="overflow-x-auto rounded-2xl border border-slate-200">
+                  <table className="w-full text-left text-xs text-slate-700">
+                    <thead className="bg-slate-50 text-slate-500 font-bold border-b border-slate-200 uppercase text-[10px] tracking-wider">
+                      <tr>
+                        <th className="px-4 py-3">Staff Member</th>
+                        <th className="px-4 py-3">WhatsApp Number</th>
+                        <th className="px-4 py-3">Assigned Role</th>
+                        <th className="px-4 py-3">Last Updated</th>
+                        <th className="px-4 py-3 text-right">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 font-medium">
+                      {usersList.length === 0 ? (
+                        <tr>
+                          <td colSpan={5} className="p-6 text-center text-slate-400 italic">
+                            No registered staff users found in Firebase /users node.
+                          </td>
+                        </tr>
+                      ) : (
+                        usersList.map((usr) => {
+                          const isMaster = usr.email?.toLowerCase().startsWith("firstoption") || usr.uid === MASTER_ADMIN_UID;
+                          const cleanPhone = String(usr.phone || "").trim();
+
+                          return (
+                            <tr key={usr.emailId || usr.email} className="hover:bg-slate-50/80 transition-colors">
+                              <td className="px-4 py-3">
+                                <div className="space-y-0.5">
+                                  <div className="font-extrabold text-slate-900 text-sm flex items-center space-x-2">
+                                    <span>{usr.name || usr.email.split("@")[0]}</span>
+                                    {isMaster && (
+                                      <span className="bg-indigo-100 text-indigo-800 text-[10px] font-extrabold px-2 py-0.5 rounded-full border border-indigo-300">
+                                        👑 Master Admin
+                                      </span>
+                                    )}
+                                  </div>
+                                  <div className="text-[11px] text-slate-500 font-medium flex items-center space-x-2">
+                                    <span>{usr.email}</span>
+                                    {usr.uid && (
+                                      <span className="bg-slate-100 text-slate-600 font-mono text-[9px] px-1.5 py-0.2 rounded border border-slate-200">
+                                        UID: {usr.uid}
+                                      </span>
+                                    )}
+                                  </div>
+                                </div>
+                              </td>
+
+                              <td className="px-4 py-3">
+                                {cleanPhone ? (
+                                  <span className="inline-flex items-center space-x-1.5 bg-emerald-50 text-emerald-800 border border-emerald-200 px-2.5 py-1 rounded-xl text-xs font-mono font-bold">
+                                    <i className="fa-brands fa-whatsapp text-emerald-600 text-sm"></i>
+                                    <span>{cleanPhone}</span>
+                                  </span>
+                                ) : (
+                                  <span className="text-[11px] font-bold text-amber-600 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-lg">
+                                    ⚠️ Missing Phone
+                                  </span>
+                                )}
+                              </td>
+
+                              <td className="px-4 py-3">
+                                <span
+                                  className={`text-xs font-extrabold px-3 py-1 rounded-xl border ${
+                                    usr.roleId === "role_admin" || usr.roleName?.toLowerCase() === "admin"
+                                      ? "bg-indigo-100 text-indigo-900 border-indigo-300"
+                                      : "bg-indigo-50 text-indigo-800 border-indigo-200"
+                                  }`}
+                                >
+                                  {usr.roleName || "Onboarding Specialist"}
+                                </span>
+                              </td>
+
+                              <td className="px-4 py-3 text-[11px] font-mono text-slate-400">
+                                {usr.updatedAt ? new Date(usr.updatedAt).toLocaleString() : "Initial"}
+                              </td>
+
+                              <td className="px-4 py-3 text-right">
+                                <div className="flex items-center justify-end space-x-2">
+                                  <button
+                                    onClick={() => handleOpenEditStaffModal(usr)}
+                                    className="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 text-xs font-bold px-2.5 py-1 rounded-xl transition-colors inline-flex items-center space-x-1 cursor-pointer"
+                                    title="Edit Name & WhatsApp Phone"
+                                  >
+                                    <i className="fa-solid fa-pen-to-square text-[10px]"></i>
+                                    <span>Edit ✏️</span>
+                                  </button>
+
+                                  {isMaster ? (
+                                    <span className="text-[11px] font-extrabold text-indigo-700 bg-indigo-50 border border-indigo-200 px-3 py-1 rounded-xl">
+                                      Permanent Admin
+                                    </span>
+                                  ) : (
+                                    <select
+                                      value={usr.roleId || "role_onboarding"}
+                                      onChange={(e) => handleAssignUserRoleByEmail(usr.email, e.target.value)}
+                                      className="bg-white border border-slate-300 rounded-xl px-2.5 py-1 text-xs font-bold text-slate-900 focus:outline-none focus:border-indigo-600 cursor-pointer"
+                                    >
+                                      {rolesList
+                                        .filter((r) => r.id !== "role_admin" && r.name.toLowerCase() !== "admin")
+                                        .map((r) => (
+                                          <option key={r.id} value={r.id}>
+                                            {r.name}
+                                          </option>
+                                        ))}
+                                    </select>
+                                  )}
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              {/* EDIT STAFF / ADMIN DETAILS MODAL */}
+              {editingStaffUser && (() => {
+                const isEditingAdmin = editingStaffUser.email?.toLowerCase().startsWith("firstoption") || editingStaffUser.uid === MASTER_ADMIN_UID || editingStaffUser.roleId === "role_admin" || editingStaffUser.roleName?.toLowerCase() === "admin";
+
+                return (
+                  <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
+                    <div className="bg-white rounded-3xl p-6 max-w-md w-full shadow-2xl border border-slate-200 space-y-4">
+                      <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+                        <h3 className="text-base font-extrabold text-slate-900 flex items-center space-x-2">
+                          <i className="fa-solid fa-user-pen text-indigo-600"></i>
+                          <span>{isEditingAdmin ? "Edit Admin Profile (Name & Phone)" : "Edit Staff Details"}</span>
+                        </h3>
+                        <button
+                          onClick={() => setEditingStaffUser(null)}
+                          className="text-slate-400 hover:text-slate-600 font-bold p-1 cursor-pointer"
+                        >
+                          ✕
+                        </button>
+                      </div>
+
+                      <div className="space-y-3 text-xs font-bold text-slate-700">
+                        <div>
+                          <label className="block mb-1">User Email (Read-Only)</label>
+                          <input
+                            type="email"
+                            disabled
+                            value={editingStaffUser.email}
+                            className="w-full bg-slate-100 border border-slate-200 rounded-xl px-3 py-2 text-slate-500 font-mono"
+                          />
+                        </div>
+
+                        <div>
+                          <label className="block mb-1">Full Name *</label>
+                          <input
+                            type="text"
+                            value={editStaffName}
+                            onChange={(e) => setEditStaffName(e.target.value)}
+                            placeholder="e.g. Rahul Sharma"
+                            className="w-full bg-white border border-slate-300 rounded-xl px-3 py-2 text-slate-900 focus:outline-none focus:border-indigo-600"
+                          />
+                        </div>
+
+                        <div>
+                          <label className="block mb-1">WhatsApp Phone Number *</label>
+                          <input
+                            type="tel"
+                            value={editStaffPhone}
+                            onChange={(e) => setEditStaffPhone(e.target.value)}
+                            placeholder="e.g. 9876543210"
+                            className="w-full bg-white border border-slate-300 rounded-xl px-3 py-2 text-slate-900 focus:outline-none focus:border-indigo-600"
+                          />
+                          <span className="text-[10px] text-slate-400 font-normal block mt-0.5">
+                            💡 Enter 10-digit number (e.g. 9876543210). Country code (+91) is automatically added when sending WhatsApp.
+                          </span>
+                        </div>
+
+                        {!isEditingAdmin && (
+                          <>
+                            <div>
+                              <label className="block mb-1">Staff UID</label>
+                              <input
+                                type="text"
+                                value={editStaffUid}
+                                onChange={(e) => setEditStaffUid(e.target.value)}
+                                placeholder="e.g. usr_10293"
+                                className="w-full bg-white border border-slate-300 rounded-xl px-3 py-2 text-slate-900 focus:outline-none focus:border-indigo-600"
+                              />
+                            </div>
+
+                            <div>
+                              <label className="block mb-1">Assigned Role</label>
+                              <select
+                                value={editStaffRoleId}
+                                onChange={(e) => setEditStaffRoleId(e.target.value)}
+                                className="w-full bg-white border border-slate-300 rounded-xl px-3 py-2 text-slate-900 focus:outline-none focus:border-indigo-600"
+                              >
+                                {rolesList
+                                  .filter((r) => r.id !== "role_admin" && r.name.toLowerCase() !== "admin")
+                                  .map((r) => (
+                                    <option key={r.id} value={r.id}>
+                                      {r.name}
+                                    </option>
+                                  ))}
+                              </select>
+                            </div>
+                          </>
+                        )}
+                      </div>
+
+                      <div className="flex items-center justify-end space-x-2 pt-2 border-t border-slate-100">
+                        <button
+                          onClick={() => setEditingStaffUser(null)}
+                          className="px-4 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-extrabold text-xs transition-colors cursor-pointer"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          onClick={handleSaveStaffDetails}
+                          disabled={isSavingStaffEdit}
+                          className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold text-xs shadow-sm transition-colors flex items-center space-x-1.5 cursor-pointer disabled:opacity-50"
+                        >
+                          {isSavingStaffEdit && <i className="fa-solid fa-circle-notch fa-spin"></i>}
+                          <span>Save Changes 💾</span>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* 4. ROLES MANAGEMENT DIRECTORY */}
+              <div className="bg-white border border-slate-200 rounded-2xl sm:rounded-3xl p-5 shadow-sm space-y-4">
+                <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+                  <h3 className="text-sm font-extrabold text-slate-900 flex items-center space-x-2">
+                    <i className="fa-solid fa-shield-halved text-emerald-600"></i>
+                    <span>Active Firebase Roles ({rolesList.length})</span>
+                  </h3>
+                  <span className="text-xs font-mono font-bold text-slate-400">
+                    Firebase Node: /roles
+                  </span>
+                </div>
+
+                {/* Form to Create Role */}
+                <form onSubmit={handleCreateNewRole} className="grid grid-cols-1 sm:grid-cols-3 gap-3 bg-slate-50 p-3.5 rounded-2xl border border-slate-200">
+                  <div className="space-y-1">
+                    <label className="text-xs font-bold text-slate-700">Role Name *</label>
+                    <input
+                      type="text"
+                      placeholder="Enter role name (e.g. Designer, Editor...)"
+                      value={newRoleName}
+                      onChange={(e) => setNewRoleName(e.target.value)}
+                      className="w-full bg-white border border-slate-300 rounded-xl px-3 py-2 text-xs font-bold text-slate-900 focus:outline-none focus:border-indigo-600"
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-xs font-bold text-slate-700">Role Description</label>
+                    <input
+                      type="text"
+                      placeholder="Enter role description..."
+                      value={newRoleDescription}
+                      onChange={(e) => setNewRoleDescription(e.target.value)}
+                      className="w-full bg-white border border-slate-300 rounded-xl px-3 py-2 text-xs text-slate-900 focus:outline-none focus:border-indigo-600"
+                    />
+                  </div>
+
+                  <div className="flex items-end">
+                    <button
+                      type="submit"
+                      disabled={isCreatingRole || !newRoleName.trim()}
+                      className="w-full bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-extrabold py-2 px-4 rounded-xl shadow-sm transition-all flex items-center justify-center space-x-2 disabled:opacity-50"
+                    >
+                      {isCreatingRole ? (
+                        <i className="fa-solid fa-circle-notch fa-spin text-xs"></i>
+                      ) : (
+                        <i className="fa-solid fa-plus text-xs"></i>
+                      )}
+                      <span>Save Role ➕</span>
+                    </button>
+                  </div>
+                </form>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3.5">
+                  {rolesList.map((role) => {
+                    const isAdmin = role.name.toLowerCase() === "admin" || role.id === "role_admin";
+
+                    return (
+                      <div
+                        key={role.id}
+                        className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-3 flex flex-col justify-between hover:border-indigo-300 transition-colors shadow-2xs"
+                      >
+                        <div className="space-y-1.5">
+                          <div className="flex items-center justify-between">
+                            <h4 className="text-sm font-extrabold text-slate-900">
+                              {role.name}
+                            </h4>
+
+                            {isAdmin && (
+                              <span className="text-[9px] font-extrabold bg-indigo-100 text-indigo-800 border border-indigo-300 px-2 py-0.5 rounded-full uppercase">
+                                System Admin
+                              </span>
+                            )}
+                          </div>
+
+                          <p className="text-xs text-slate-600 leading-relaxed font-medium">
+                            {role.description || "No description provided."}
+                          </p>
+                        </div>
+
+                        {!isAdmin && (
+                          <div className="pt-2 border-t border-slate-200/80 flex items-center justify-between text-[10px] text-slate-400 font-mono">
+                            <span>Soft Delete Protected</span>
+                            <button
+                              onClick={() => handleDeleteRole(role)}
+                              className="text-rose-600 hover:text-rose-800 text-xs font-bold bg-white border border-rose-200 px-2.5 py-1 rounded-xl transition-colors inline-flex items-center space-x-1"
+                            >
+                              <i className="fa-solid fa-trash-can text-[10px]"></i>
+                              <span>Delete Role</span>
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          ) : activeTab === "tickets" ? (
+            <div className="space-y-5 font-sans">
+              {/* Top Header Card */}
+              <div className="bg-white border border-slate-200 rounded-2xl sm:rounded-3xl p-5 shadow-sm space-y-2 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div className="flex items-center space-x-3">
+                  <div className="w-10 h-10 rounded-2xl bg-indigo-50 border border-indigo-200 flex items-center justify-center text-lg text-indigo-600 shadow-2xs flex-shrink-0">
+                    <i className="fa-solid fa-ticket"></i>
+                  </div>
+                  <div>
+                    <h2 className="text-base sm:text-lg font-extrabold text-slate-900">
+                      Client Support Tickets Directory
+                    </h2>
+                    <p className="text-xs text-slate-500 font-medium">
+                      Manage and resolve support tickets raised by clients with urgency levels (Level 1 to Level 4).
+                    </p>
+                  </div>
+                </div>
+
+                <button
+                  onClick={fetchSupportTickets}
+                  disabled={isLoadingTickets}
+                  className="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 font-extrabold text-xs px-4 py-2.5 rounded-xl shadow-2xs transition-all flex items-center space-x-2 cursor-pointer self-start sm:self-auto"
+                >
+                  <i className={`fa-solid fa-rotate-right ${isLoadingTickets ? "fa-spin" : ""}`}></i>
+                  <span>Refresh Tickets 🔄</span>
+                </button>
+              </div>
+
+              {/* KPI Summary Cards */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                <div className="bg-white border border-slate-200 rounded-2xl p-4 shadow-sm">
+                  <p className="text-[11px] font-bold text-slate-500 uppercase">Total Tickets</p>
+                  <p className="text-xl font-black text-slate-900 mt-1">{supportTickets.length}</p>
+                </div>
+
+                <div className="bg-white border border-rose-200 rounded-2xl p-4 shadow-sm">
+                  <p className="text-[11px] font-extrabold text-rose-600 uppercase flex items-center space-x-1">
+                    <span className="w-2 h-2 rounded-full bg-rose-500 animate-pulse"></span>
+                    <span>Open Tickets</span>
+                  </p>
+                  <p className="text-xl font-black text-rose-700 mt-1">
+                    {supportTickets.filter((t) => t.status === "open").length}
+                  </p>
+                </div>
+
+                <div className="bg-white border border-amber-200 rounded-2xl p-4 shadow-sm">
+                  <p className="text-[11px] font-extrabold text-amber-600 uppercase">In Progress</p>
+                  <p className="text-xl font-black text-amber-700 mt-1">
+                    {supportTickets.filter((t) => t.status === "in_progress").length}
+                  </p>
+                </div>
+
+                <div className="bg-white border border-emerald-200 rounded-2xl p-4 shadow-sm">
+                  <p className="text-[11px] font-extrabold text-emerald-600 uppercase">Resolved</p>
+                  <p className="text-xl font-black text-emerald-700 mt-1">
+                    {supportTickets.filter((t) => t.status === "resolved").length}
+                  </p>
+                </div>
+              </div>
+
+              {/* Filters Bar */}
+              <div className="bg-white border border-slate-200 rounded-2xl p-3 shadow-sm flex flex-col sm:flex-row items-center justify-between gap-3 text-xs">
+                <div className="relative w-full sm:w-72">
+                  <i className="fa-solid fa-magnifying-glass absolute left-3 top-2.5 text-slate-400 text-xs"></i>
+                  <input
+                    type="text"
+                    value={ticketSearchQuery}
+                    onChange={(e) => setTicketSearchQuery(e.target.value)}
+                    placeholder="Search by ticket #, client, subject..."
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl pl-9 pr-3 py-1.5 text-slate-900 text-xs font-bold focus:outline-none focus:border-indigo-600"
+                  />
+                </div>
+
+                <div className="flex items-center space-x-2 w-full sm:w-auto">
+                  <select
+                    value={ticketLevelFilter}
+                    onChange={(e) => setTicketLevelFilter(e.target.value)}
+                    className="bg-slate-50 border border-slate-200 rounded-xl px-3 py-1.5 text-slate-900 text-xs font-bold focus:outline-none focus:border-indigo-600 cursor-pointer"
+                  >
+                    <option value="all">All Urgency Levels</option>
+                    <option value="level1">🚨 Level 1 (Critical)</option>
+                    <option value="level2">⚡ Level 2 (High)</option>
+                    <option value="level3">📌 Level 3 (Medium)</option>
+                    <option value="level4">ℹ️ Level 4 (Low)</option>
+                  </select>
+
+                  <select
+                    value={ticketStatusFilter}
+                    onChange={(e) => setTicketStatusFilter(e.target.value)}
+                    className="bg-slate-50 border border-slate-200 rounded-xl px-3 py-1.5 text-slate-900 text-xs font-bold focus:outline-none focus:border-indigo-600 cursor-pointer"
+                  >
+                    <option value="all">All Statuses</option>
+                    <option value="open">🔴 Open</option>
+                    <option value="in_progress">🟡 In Progress</option>
+                    <option value="resolved">🟢 Resolved</option>
+                  </select>
+                </div>
+              </div>
+
+              {/* Tickets Cards Directory */}
+              <div className="bg-white border border-slate-200 rounded-2xl sm:rounded-3xl p-5 shadow-sm space-y-4">
+                {(() => {
+                  const filteredSupportTickets = supportTickets.filter((t) => {
+                    const matchesSearch =
+                      !ticketSearchQuery ||
+                      t.ticketNumber.toLowerCase().includes(ticketSearchQuery.toLowerCase()) ||
+                      t.clientName.toLowerCase().includes(ticketSearchQuery.toLowerCase()) ||
+                      t.clientEmail.toLowerCase().includes(ticketSearchQuery.toLowerCase()) ||
+                      t.subject.toLowerCase().includes(ticketSearchQuery.toLowerCase());
+
+                    const matchesLevel = ticketLevelFilter === "all" || t.level === ticketLevelFilter;
+                    const matchesStatus = ticketStatusFilter === "all" || t.status === ticketStatusFilter;
+
+                    return matchesSearch && matchesLevel && matchesStatus;
+                  });
+
+                  if (filteredSupportTickets.length === 0) {
+                    return (
+                      <div className="text-center py-12 space-y-2">
+                        <div className="w-12 h-12 rounded-2xl bg-indigo-50 text-indigo-600 flex items-center justify-center text-xl mx-auto">
+                          <i className="fa-solid fa-ticket-simple"></i>
+                        </div>
+                        <h3 className="text-sm font-extrabold text-slate-900">No Support Tickets Found</h3>
+                        <p className="text-xs text-slate-500">When clients raise support tickets from their portal, they will appear here instantly.</p>
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      {filteredSupportTickets.map((t) => {
+                        const levelConfig = {
+                          level1: { badge: "bg-rose-100 text-rose-800 border-rose-300", icon: "🚨 Level 1 (Critical)" },
+                          level2: { badge: "bg-amber-100 text-amber-800 border-amber-300", icon: "⚡ Level 2 (High)" },
+                          level3: { badge: "bg-indigo-100 text-indigo-800 border-indigo-300", icon: "📌 Level 3 (Medium)" },
+                          level4: { badge: "bg-slate-100 text-slate-800 border-slate-300", icon: "ℹ️ Level 4 (Low)" },
+                        }[t.level] || { badge: "bg-slate-100 text-slate-800 border-slate-300", icon: t.levelLabel };
+
+                        const cleanPhone = (t.clientPhone || "").replace(/\D/g, "");
+                        const waNumber = cleanPhone.length === 10 ? "91" + cleanPhone : cleanPhone;
+
+                        return (
+                          <div key={t.id} className="bg-white border border-slate-200 hover:border-indigo-300 rounded-2xl p-4 shadow-sm hover:shadow-md transition-all space-y-3">
+                            <div className="flex items-start justify-between gap-2 border-b border-slate-100 pb-3">
+                              <div>
+                                <div className="flex items-center space-x-2">
+                                  <span className="font-mono text-xs font-black text-indigo-700 bg-indigo-50 border border-indigo-200 px-2 py-0.5 rounded-lg">
+                                    #{t.ticketNumber}
+                                  </span>
+                                  <span className={`text-[10px] font-black px-2 py-0.5 rounded-lg border ${levelConfig.badge}`}>
+                                    {levelConfig.icon}
+                                  </span>
+                                </div>
+                                <h4 className="text-sm font-extrabold text-slate-900 mt-1.5">{t.subject}</h4>
+                              </div>
+
+                              <select
+                                value={t.status}
+                                onChange={(e) => handleUpdateTicketStatus(t.id, e.target.value as any)}
+                                className={`text-xs font-black rounded-xl px-2.5 py-1 border focus:outline-none cursor-pointer ${
+                                  t.status === "resolved"
+                                    ? "bg-emerald-50 text-emerald-800 border-emerald-300"
+                                    : t.status === "in_progress"
+                                    ? "bg-amber-50 text-amber-800 border-amber-300"
+                                    : "bg-rose-50 text-rose-800 border-rose-300"
+                                }`}
+                              >
+                                <option value="open">🔴 Open</option>
+                                <option value="in_progress">🟡 In Progress</option>
+                                <option value="resolved">🟢 Resolved</option>
+                              </select>
+                            </div>
+
+                            <p className="text-xs text-slate-600 whitespace-pre-wrap leading-relaxed font-normal bg-slate-50 border border-slate-100 p-3 rounded-xl">
+                              {t.description}
+                            </p>
+
+                            <div className="flex items-center justify-between text-xs pt-1">
+                              <div className="space-y-0.5">
+                                <p className="font-extrabold text-slate-900 flex items-center space-x-1">
+                                  <i className="fa-solid fa-user text-[10px] text-slate-400"></i>
+                                  <span>{t.clientName}</span>
+                                </p>
+                                <p className="text-[10px] text-slate-500 font-mono">{t.clientEmail}</p>
+                              </div>
+
+                              {waNumber && (
+                                <a
+                                  href={`https://wa.me/${waNumber}?text=${encodeURIComponent(`Hi ${t.clientName}, regarding your support ticket #${t.ticketNumber} (${t.subject}): `)}`}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 text-[11px] font-extrabold px-3 py-1.5 rounded-xl transition-colors inline-flex items-center space-x-1.5 shadow-2xs"
+                                >
+                                  <i className="fa-brands fa-whatsapp text-emerald-600 text-xs"></i>
+                                  <span>Chat on WhatsApp</span>
+                                </a>
+                              )}
+                            </div>
+
+                            <div className="border-t border-slate-100 pt-2 flex items-center justify-between text-[10px] text-slate-400 font-medium">
+                              <span>Submitted: {new Date(t.createdAt).toLocaleString()}</span>
+                              <div className="flex items-center space-x-2">
+                                {t.resolvedBy && <span>Resolved by: {t.resolvedBy}</span>}
+                                <button
+                                  onClick={() => handleDeleteTicket(t)}
+                                  title="Delete Support Ticket"
+                                  className="text-rose-600 hover:text-rose-800 hover:bg-rose-50 border border-rose-200 px-2 py-0.5 rounded-lg text-[10px] font-extrabold transition-colors flex items-center space-x-1 cursor-pointer"
+                                >
+                                  <i className="fa-solid fa-trash-can text-[10px]"></i>
+                                  <span>Delete Ticket</span>
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  );
+                })()}
+              </div>
+            </div>
+          ) : activeTab === "pipeline" ? (
+            <div className="space-y-4 font-sans">
+              {/* Pipeline Top Bar */}
+              <div className="bg-white border border-slate-200 rounded-2xl p-4 shadow-sm space-y-3">
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 border-b border-slate-100 pb-3">
+                  <div className="flex items-center space-x-3 flex-wrap gap-y-1">
+                    <h3 className="text-sm sm:text-base font-extrabold text-slate-900">
+                      Lead Pipeline Stage Board
+                    </h3>
+                    <span className="text-xs font-semibold text-slate-500 bg-slate-100 px-2.5 py-0.5 rounded-full border border-slate-200">
+                      {filteredPipelineLeads.length} leads matching filter
+                    </span>
+                  </div>
+
+                  <div className="flex items-center space-x-2 flex-wrap gap-2">
+                    <select
+                      value={pipelineTargetField}
+                      onChange={(e) => setPipelineTargetField(e.target.value as "meeting" | "created" | "followup")}
+                      className="bg-slate-50 border border-slate-300 rounded-xl px-2.5 py-1.5 text-xs font-bold text-indigo-700 focus:outline-none"
+                    >
+                      <option value="created">📝 Created Wise</option>
+                      <option value="meeting">📅 Meeting Wise</option>
+                      <option value="followup">📌 Follow-up Wise</option>
+                    </select>
+
+                    <select
+                      value={pipelineDatePreset}
+                      onChange={(e) => setPipelineDatePreset(e.target.value as any)}
+                      className="bg-slate-50 border border-slate-300 rounded-xl px-2.5 py-1.5 text-xs font-bold text-slate-800 focus:outline-none"
+                    >
+                      <option value="all_time">🌐 All Time (Default)</option>
+                      <option value="specific_date">🎯 Specific Day</option>
+                      <option value="today">☀️ Today</option>
+                      <option value="yesterday">⏪ Yesterday</option>
+                      <option value="last_7_days">⚡ Last 7 Days</option>
+                      <option value="upcoming_7_days">🔮 Upcoming 7 Days</option>
+                      <option value="custom_range">📆 Custom Date Range</option>
+                    </select>
+
+                    <select
+                      value={pipelinePhoneFilter}
+                      onChange={(e) => setPipelinePhoneFilter(e.target.value as any)}
+                      className="bg-slate-50 border border-slate-300 rounded-xl px-2.5 py-1.5 text-xs font-bold text-slate-800 focus:outline-none"
+                    >
+                      <option value="all">👥 All Phone Statuses</option>
+                      <option value="has_phone">📱 Valid Phone Only</option>
+                      <option value="no_phone">⚠️ Missing Phone / Anonymous</option>
+                    </select>
+
+                    {pipelineDatePreset === "specific_date" && (
+                      <input
+                        type="date"
+                        value={pipelineSingleDate}
+                        onChange={(e) => setPipelineSingleDate(e.target.value)}
+                        className="bg-white border border-slate-300 rounded-xl px-2.5 py-1 text-xs font-bold text-slate-900 focus:outline-none focus:border-indigo-600"
+                      />
+                    )}
+
+                    {pipelineDatePreset === "custom_range" && (
+                      <div className="flex items-center space-x-1.5">
+                        <span className="text-[10px] text-slate-500 font-bold">Start:</span>
+                        <input
+                          type="date"
+                          value={pipelineStartDate}
+                          onChange={(e) => setPipelineStartDate(e.target.value)}
+                          className="bg-white border border-slate-300 rounded-xl px-2 py-1 text-xs font-bold text-slate-900 focus:outline-none"
+                        />
+                        <span className="text-[10px] text-slate-500 font-bold">End:</span>
+                        <input
+                          type="date"
+                          value={pipelineEndDate}
+                          onChange={(e) => setPipelineEndDate(e.target.value)}
+                          className="bg-white border border-slate-300 rounded-xl px-2 py-1 text-xs font-bold text-slate-900 focus:outline-none"
+                        />
+                      </div>
+                    )}
+
+                    <input
+                      type="text"
+                      placeholder="Search name, phone..."
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      className="bg-slate-50 border border-slate-300 rounded-xl px-3 py-1.5 text-xs text-slate-800 placeholder-slate-400 focus:outline-none w-36 sm:w-44"
+                    />
+
+                    <button
+                      onClick={() => setIsManagePipelineModalOpen(true)}
+                      className="bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-extrabold px-3 py-1.5 rounded-xl shadow-2xs transition-colors flex items-center space-x-1.5 cursor-pointer"
+                    >
+                      <i className="fa-solid fa-gear"></i>
+                      <span>Manage Stages ⚙️</span>
+                    </button>
+                  </div>
+                </div>
+
+                <div className="flex items-center space-x-2 text-xs font-bold text-slate-500 overflow-x-auto pt-1 scrollbar-thin scroll-smooth touch-pan-x">
+                  <button
+                    onClick={() => changeTab("leads")}
+                    className="px-3 py-1.5 rounded-xl hover:bg-slate-100 transition-colors whitespace-nowrap"
+                  >
+                    All Leads List
+                  </button>
+                  <button
+                    onClick={() => changeTab("pipeline")}
+                    className="px-3 py-1.5 rounded-xl bg-indigo-50 text-indigo-600 border border-indigo-200 shadow-2xs whitespace-nowrap font-extrabold"
+                  >
+                    Pipeline Board
+                  </button>
+                  <button
+                    onClick={() => changeTab("meetings")}
+                    className="px-3 py-1.5 rounded-xl hover:bg-slate-100 transition-colors whitespace-nowrap"
+                  >
+                    Scheduled Meetings
+                  </button>
+                  <button
+                    onClick={() => changeTab("calendar")}
+                    className="px-3 py-1.5 rounded-xl hover:bg-slate-100 transition-colors whitespace-nowrap"
+                  >
+                    Meetings Calendar
+                  </button>
+                </div>
+              </div>
+
+              {/* STAGE QUICK-SCROLL NAVIGATION BAR FOR EASY MOBILE & TOUCH SCROLLING */}
+              <div className="bg-white border border-slate-200/90 rounded-2xl p-2.5 shadow-2xs flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-2.5">
+                <div className="flex items-center justify-between space-x-2 flex-shrink-0">
+                  <div className="flex items-center space-x-2">
+                    <span className="bg-indigo-50 text-indigo-700 text-xs px-2.5 py-1 rounded-xl font-bold flex items-center gap-1.5 border border-indigo-100">
+                      <i className="fa-solid fa-arrows-left-right text-[10px]"></i>
+                      Quick Jump
+                    </span>
+                    <span className="text-xs font-bold text-slate-500 hidden md:inline">Stage Navigation:</span>
+                  </div>
+
+                  {/* Left & Right Scroll Buttons */}
+                  <div className="flex items-center space-x-1">
+                    <button
+                      onClick={() => scrollPipeline("left")}
+                      className="w-7 h-7 rounded-lg bg-slate-50 hover:bg-indigo-50 text-slate-600 hover:text-indigo-600 active:scale-95 flex items-center justify-center transition-all border border-slate-200/80 shadow-2xs cursor-pointer"
+                      title="Scroll Pipeline Left"
+                      type="button"
+                    >
+                      <i className="fa-solid fa-chevron-left text-[11px]"></i>
+                    </button>
+                    <button
+                      onClick={() => scrollPipeline("right")}
+                      className="w-7 h-7 rounded-lg bg-slate-50 hover:bg-indigo-50 text-slate-600 hover:text-indigo-600 active:scale-95 flex items-center justify-center transition-all border border-slate-200/80 shadow-2xs cursor-pointer"
+                      title="Scroll Pipeline Right"
+                      type="button"
+                    >
+                      <i className="fa-solid fa-chevron-right text-[11px]"></i>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Stage Pills Navigation Strip */}
+                <div className="flex items-center space-x-2 overflow-x-auto py-0.5 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden scroll-smooth touch-pan-x flex-1 max-w-full">
+                  {activePipelineStages.map((st) => {
+                    const count = filteredPipelineLeads.filter((l) => getLeadEffectiveStage(l) === st.id).length;
+                    return (
+                      <button
+                        key={`quick-nav-${st.id}`}
+                        onClick={() => scrollToStageColumn(st.id)}
+                        type="button"
+                        className="flex-shrink-0 flex items-center space-x-1.5 px-2.5 py-1 rounded-xl bg-slate-50 hover:bg-indigo-50/80 hover:border-indigo-200 active:scale-95 text-xs font-bold text-slate-700 hover:text-indigo-700 transition-all border border-slate-200/80 cursor-pointer group shadow-2xs"
+                      >
+                        <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ backgroundColor: st.color }} />
+                        <span className="whitespace-nowrap">{st.name}</span>
+                        <span className="bg-slate-200/70 group-hover:bg-indigo-100 text-slate-700 group-hover:text-indigo-800 px-1.5 py-0.2 text-[10px] rounded-md font-mono font-bold">
+                          {count}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* DRAG-AND-DROP KANBAN PIPELINE COLUMNS */}
+              <div
+                ref={pipelineBoardRef}
+                className="flex items-start space-x-3.5 overflow-x-auto pb-6 pt-1 min-h-[620px] scrollbar-thin scroll-smooth touch-pan-x"
+              >
+                {activePipelineStages.map((stage) => {
+                  const stageLeads = filteredPipelineLeads.filter((l) => getLeadEffectiveStage(l) === stage.id);
+                  const totalStageValue = stageLeads.reduce((acc, l) => acc + (l.dealValue || 0), 0);
+
+                  return (
+                    <div
+                      key={stage.id}
+                      id={`stage-col-${stage.id}`}
+                      onDragOver={(e) => e.preventDefault()}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        const leadDataStr = e.dataTransfer.getData("text/plain");
+                        if (leadDataStr) {
+                          try {
+                            const draggedLead: LeadData = JSON.parse(leadDataStr);
+                            handleUpdateStage(draggedLead, stage.id);
+                          } catch (err) {
+                            console.error("Drop parse error:", err);
+                          }
+                        }
+                      }}
+                      className="w-72 sm:w-80 flex-shrink-0 bg-[#f8fafc] border border-slate-200/90 rounded-2xl p-3 flex flex-col space-y-3 shadow-2xs min-h-[580px]"
+                    >
+                      <div className="flex items-center justify-between border-b border-slate-200/80 pb-2 px-1">
+                        <div className="flex items-center space-x-2 truncate">
+                          <span
+                            className="w-2.5 h-2.5 rounded-full flex-shrink-0"
+                            style={{ backgroundColor: stage.color }}
+                          />
+                          <h4 className="text-xs font-extrabold text-slate-900 truncate">
+                            {stage.name}
+                          </h4>
+                          <span className="text-[11px] font-bold text-slate-400 font-mono">
+                            ({stageLeads.length})
+                          </span>
+                        </div>
+
+                        <div className="flex items-center space-x-1.5">
+                          <button
+                            onClick={() => handleOpenStageAutomationModal(stage)}
+                            className="text-[10px] font-bold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 px-2 py-0.5 rounded-md transition-colors flex items-center space-x-1 cursor-pointer"
+                            title="Configure Stage WhatsApp Automations"
+                          >
+                            <span>⚡ Auto</span>
+                          </button>
+
+                          <span className="text-[11px] font-mono font-extrabold text-slate-700 bg-white px-2 py-0.5 rounded-md border border-slate-200">
+                            ₹{totalStageValue.toLocaleString("en-IN")}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="flex-1 space-y-2.5 overflow-y-auto max-h-[720px] pr-0.5">
+                        {stageLeads.length === 0 ? (
+                          <div className="h-32 border-2 border-dashed border-slate-200 rounded-xl flex items-center justify-center text-slate-400 font-bold text-xs">
+                            No leads
+                          </div>
+                        ) : (
+                          stageLeads.map((lead) => {
+                            const cleanPhoneNum = (lead.phone || "").replace(/\D/g, "");
+                            const hasPhone = cleanPhoneNum.length >= 5;
+                            const isMissingPhone = !hasPhone;
+
+                            const stageAutomations = stageAutomationsMap[stage.id] || [];
+                            const hasMeetingRequirement = stageAutomations.some((a) => a.isEnabled && a.triggerBase === "meeting");
+
+                            const meetingDateVal = lead.meeting?.meetingDate || (lead as any).meetingDate || (lead as any).date;
+                            const meetingTimeVal = lead.meeting?.meetingTime || (lead as any).meetingTime || (lead as any).time;
+                            const isMissingMeetingInfo = hasMeetingRequirement && (!meetingDateVal || !meetingTimeVal);
+
+                            // Calculate Next Scheduled WhatsApp Countdown
+                            let nextCountdownStr: string | null = null;
+                            let isCompletedRule = false;
+                            const activeRules = stageAutomations.filter((r) => r.isEnabled);
+
+                            if (hasPhone && !isMissingMeetingInfo && activeRules.length > 0) {
+                              let futureTargetMs: number | null = null;
+                              let hasValidRules = false;
+                              let allRulesPast = true;
+
+                              for (const rule of activeRules) {
+                                let refDate: Date | null = null;
+                                if (rule.triggerBase === "meeting") {
+                                  // Skip meeting reminder countdown for Won or Not Qualified leads
+                                  if (lead.pipelineStage === "won" || lead.pipelineStage === "not_qualified") {
+                                    continue;
+                                  }
+                                  refDate = parseMeetingDateTime(meetingDateVal, meetingTimeVal);
+                                } else {
+                                  const rawCreated = (lead as any).stageMovedAt || lead.createdAt || lead.createdDate || (lead as any).timestamp || lead.meeting?.bookedAt;
+                                  refDate = rawCreated ? new Date(rawCreated) : new Date();
+                                }
+
+                                if (refDate && !isNaN(refDate.getTime())) {
+                                  hasValidRules = true;
+                                  let offsetMs = Number(rule.offsetValue) * 60 * 1000;
+                                  if (rule.offsetUnit === "hours") offsetMs = Number(rule.offsetValue) * 3600 * 1000;
+                                  if (rule.offsetUnit === "days") offsetMs = Number(rule.offsetValue) * 86400 * 1000;
+                                  if (offsetMs <= 0) offsetMs = 60000;
+
+                                  let effectiveOffsetType = rule.triggerBase === "created" ? "after" : rule.offsetType;
+                                  let targetMs = 0;
+                                  if (effectiveOffsetType === "before") {
+                                    targetMs = refDate.getTime() - offsetMs;
+                                  } else {
+                                    targetMs = refDate.getTime() + offsetMs;
+                                  }
+
+                                  // Sync with Server Lead Timers if available
+                                  const fullCleanPhone = cleanPhoneNum.length === 10 ? "91" + cleanPhoneNum : cleanPhoneNum;
+                                  const serverTimerRecord = leadTimersMap[cleanPhoneNum] || leadTimersMap[fullCleanPhone];
+                                  if (serverTimerRecord && serverTimerRecord.nextTriggerTimeMs && serverTimerRecord.leadStage === lead.pipelineStage) {
+                                    targetMs = serverTimerRecord.nextTriggerTimeMs;
+                                  }
+
+                                  if (targetMs > nowTick) {
+                                    allRulesPast = false;
+                                    if (futureTargetMs === null || targetMs < futureTargetMs) {
+                                      futureTargetMs = targetMs;
+                                    }
+                                  }
+                                }
+                              }
+
+                              if (hasValidRules) {
+                                if (futureTargetMs !== null) {
+                                  const diffMs = futureTargetMs - nowTick;
+                                  const diffSec = Math.floor(diffMs / 1000);
+                                  const days = Math.floor(diffSec / 86400);
+                                  const hours = Math.floor((diffSec % 86400) / 3600);
+                                  const mins = Math.floor((diffSec % 3600) / 60);
+                                  const secs = diffSec % 60;
+
+                                  isCompletedRule = false;
+                                  if (days > 0) nextCountdownStr = `${days}d ${hours}h ${mins}m`;
+                                  else if (hours > 0) nextCountdownStr = `${hours}h ${mins}m ${secs.toString().padStart(2, "0")}s`;
+                                  else if (mins > 0) nextCountdownStr = `${mins}m ${secs.toString().padStart(2, "0")}s`;
+                                  else nextCountdownStr = `${secs}s`;
+                                } else if (allRulesPast) {
+                                  isCompletedRule = true;
+                                  nextCountdownStr = "✅ Automation Dispatched";
+                                }
+                              }
+                            }
+
+                            const leadIdKey = lead.id || (lead.email ? sanitizeEmailToId(lead.email) : "l_" + Math.random());
+
+                            return (
+                              <div
+                                key={leadIdKey}
+                                draggable={true}
+                                onDragStart={(e) => {
+                                  e.dataTransfer.setData("text/plain", JSON.stringify(lead));
+                                }}
+                                onClick={() => handleOpenDrawer(lead)}
+                                className="bg-white border border-slate-200 rounded-xl p-3 space-y-2 shadow-sm hover:shadow-md transition-all cursor-grab active:cursor-grabbing group hover:border-indigo-300"
+                              >
+                                {isMissingPhone ? (
+                                  <div className="bg-amber-50 border border-amber-200 text-amber-900 text-[10px] font-bold px-2 py-1 rounded-lg flex items-center justify-between shadow-2xs">
+                                    <span className="flex items-center space-x-1 truncate">
+                                      <i className="fa-solid fa-triangle-exclamation text-amber-600"></i>
+                                      <span>⚠️ Phone missing — WhatsApp skipped</span>
+                                    </span>
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleDeleteLead(lead);
+                                      }}
+                                      className="text-rose-600 hover:text-rose-800 text-[10px] font-bold px-1.5 py-0.5 rounded hover:bg-rose-100 transition-all flex-shrink-0"
+                                      title="Delete lead from database"
+                                    >
+                                      <i className="fa-solid fa-trash-can"></i>
+                                    </button>
+                                  </div>
+                                ) : isMissingMeetingInfo ? (
+                                  <div className="bg-rose-50 border border-rose-200 text-rose-800 text-[10px] font-bold px-2.5 py-1 rounded-lg flex items-center space-x-1">
+                                    <span>⚠️ Meeting Date missing - WhatsApp reminder skipped</span>
+                                  </div>
+                                ) : nextCountdownStr ? (
+                                  <div
+                                    className={`${
+                                      isCompletedRule
+                                        ? "bg-emerald-50 border-emerald-200 text-emerald-900"
+                                        : "bg-indigo-50 border-indigo-200 text-indigo-900"
+                                    } border text-[10px] font-extrabold px-2.5 py-1 rounded-lg flex items-center justify-between shadow-2xs`}
+                                  >
+                                    <span className="flex items-center space-x-1">
+                                      <i
+                                        className={`fa-solid ${
+                                          isCompletedRule ? "fa-circle-check text-emerald-600" : "fa-clock-rotate-left text-indigo-600 fa-spin"
+                                        }`}
+                                      ></i>
+                                      <span>Next WhatsApp:</span>
+                                    </span>
+                                    <span
+                                      className={`font-mono ${
+                                        isCompletedRule
+                                          ? "text-emerald-700 bg-white border-emerald-200"
+                                          : "text-indigo-700 bg-white border-indigo-200"
+                                      } px-1.5 py-0.5 rounded border shadow-2xs`}
+                                    >
+                                      {isCompletedRule ? "✅ Dispatched" : `⏱️ ${nextCountdownStr}`}
+                                    </span>
+                                  </div>
+                                ) : null}
+                                <div className="flex items-start justify-between gap-1">
+                                  <div className="truncate">
+                                    <h5 className="text-xs font-extrabold text-slate-900 group-hover:text-indigo-600 transition-colors truncate">
+                                      {lead.fullName || "Anonymous Lead"}
+                                    </h5>
+                                    <p className="text-[10px] text-slate-400 truncate">{lead.email || "No email"}</p>
+                                  </div>
+
+                                  <div className="flex items-center space-x-1 flex-shrink-0">
+                                    <span className={`text-[9px] font-extrabold px-1.5 py-0.5 rounded border ${stage.bgTag}`}>
+                                      {stage.name}
+                                    </span>
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleDeleteLead(lead);
+                                      }}
+                                      className="text-slate-400 hover:text-rose-600 p-1 rounded transition-colors text-xs opacity-0 group-hover:opacity-100"
+                                      title="Delete Lead"
+                                    >
+                                      <i className="fa-solid fa-trash-can"></i>
+                                    </button>
+                                  </div>
+                                </div>
+
+                                <div className="flex items-center justify-between text-[11px] font-mono pt-0.5">
+                                  <span className={hasPhone ? "text-slate-600 font-semibold" : "text-amber-700 font-bold italic text-[10px]"}>
+                                    📞 {hasPhone ? `${lead.countryCode || "+91"} ${lead.phone}` : "No Phone Provided"}
+                                  </span>
+
+                                  {hasPhone && (
+                                    <div className="flex items-center space-x-1.5">
+                                      {/* 📜 WHATSAPP LOGS BUTTON */}
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          handleOpenLeadLogsModal(lead);
+                                        }}
+                                        className="text-[10px] font-bold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 px-1.5 py-0.5 rounded transition-all cursor-pointer flex items-center space-x-1"
+                                        title="View WhatsApp Dispatch Logs for this Lead"
+                                      >
+                                        <span>📜 Logs</span>
+                                      </button>
+
+                                      <a
+                                        href={`https://api.whatsapp.com/send?phone=${lead.countryCode ? lead.countryCode.replace("+", "") : "91"}${lead.phone}`}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        onClick={(e) => e.stopPropagation()}
+                                        className="text-emerald-600 hover:text-emerald-700 font-bold text-xs"
+                                      >
+                                        <i className="fa-brands fa-whatsapp text-sm"></i>
+                                      </a>
+                                    </div>
+                                  )}
+                                </div>
+
+                                <div className="text-[10px] text-slate-400 font-mono flex items-center justify-between bg-slate-50 px-2 py-1 rounded border border-slate-100">
+                                  <span>📅 {lead.meeting?.meetingDate || lead.createdDate || "N/A"}</span>
+                                  {lead.meeting?.meetingTime && (
+                                    <span className="font-bold text-indigo-600">🕒 {lead.meeting.meetingTime}</span>
+                                  )}
+                                </div>
+
+                                {/* Google Meet Video Call Button */}
+                                {lead.meeting?.meetingUrl && (
+                                  <div className="pt-0.5">
+                                    <a
+                                      href={lead.meeting.meetingUrl}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      onClick={(e) => e.stopPropagation()}
+                                      className="w-full bg-indigo-600 hover:bg-indigo-700 text-white text-[10px] font-extrabold py-1.5 px-2.5 rounded-lg flex items-center justify-center space-x-1.5 shadow-sm transition-all cursor-pointer"
+                                    >
+                                      <i className="fa-solid fa-video text-xs"></i>
+                                      <span>Join Google Meet Call 🎥</span>
+                                    </a>
+                                  </div>
+                                )}
+
+                                {(lead.followUpDate || (lead.notes && lead.notes.length > 0) || lead.dealValue) && (
+                                  <div className="flex items-center space-x-1.5 flex-wrap gap-y-1 pt-0.5">
+                                    {lead.dealValue ? (
+                                      <span className="text-[10px] font-extrabold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
+                                        ₹{lead.dealValue.toLocaleString("en-IN")}
+                                      </span>
+                                    ) : null}
+
+                                    {lead.followUpDate && (
+                                      <span className="text-[10px] font-bold text-indigo-700 bg-indigo-50 px-1.5 py-0.5 rounded border border-indigo-200">
+                                        Follow: {lead.followUpDate}
+                                      </span>
+                                    )}
+
+                                    {lead.notes && lead.notes.length > 0 && (
+                                      <span className="text-[10px] font-bold text-slate-600 bg-slate-100 px-1.5 py-0.5 rounded border border-slate-200">
+                                        📝 {lead.notes.length}
+                                      </span>
+                                    )}
+                                  </div>
+                                )}
+
+                                <div className="pt-2 border-t border-slate-100 space-y-1.5" onClick={(e) => e.stopPropagation()}>
+                                  <div className="flex items-center justify-between pt-0.5">
+                                    <span className="text-[10px] text-slate-400 font-bold">Move Stage:</span>
+                                    <select
+                                       value={getLeadEffectiveStage(lead)}
+                                       onChange={(e) => handleUpdateStage(lead, e.target.value)}
+                                       className="bg-slate-50 border border-slate-200 rounded text-[10px] font-bold text-slate-800 px-1.5 py-0.5 focus:outline-none focus:border-indigo-600 cursor-pointer"
+                                     >
+                                       {activePipelineStages.map((st) => (
+                                         <option key={st.id} value={st.id}>
+                                           {st.name}
+                                         </option>
+                                       ))}
+                                     </select>
+                                  </div>
+                                </div>
+                              </div>
+                            );
+                          })
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ) : activeTab === "calendar" ? (
+            <div className="bg-white border border-slate-200 rounded-2xl sm:rounded-3xl shadow-sm p-4 sm:p-6 space-y-4 font-sans">
+              <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 border-b border-slate-100 pb-4">
+                <div className="flex items-center space-x-3">
+                  <div>
+                    <h2 className="text-base sm:text-xl font-extrabold text-slate-900">
+                      Meetings Calendar
+                    </h2>
+                    <div className="flex items-center space-x-2 mt-0.5">
+                      <span className="text-xs font-bold text-slate-500">Calendar View</span>
+                      <span className="bg-indigo-50 border border-indigo-200 text-indigo-700 text-[10px] font-black px-2.5 py-0.5 rounded-full uppercase tracking-wider">
+                        {allMeetingsList.length} EVENTS
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex items-center space-x-3">
+                  <div className="flex items-center space-x-1">
+                    <button
+                      onClick={handlePrevCalMonth}
+                      className="w-8 h-8 rounded-xl border border-slate-200 text-slate-600 hover:bg-slate-100 flex items-center justify-center text-xs transition-colors shadow-2xs"
+                    >
+                      <i className="fa-solid fa-chevron-left"></i>
+                    </button>
+                    <button
+                      onClick={handleNextCalMonth}
+                      className="w-8 h-8 rounded-xl border border-slate-200 text-slate-600 hover:bg-slate-100 flex items-center justify-center text-xs transition-colors shadow-2xs"
+                    >
+                      <i className="fa-solid fa-chevron-right"></i>
+                    </button>
+                  </div>
+
+                  <button
+                    onClick={handleTodayCalMonth}
+                    className="px-3 py-1.5 rounded-xl border border-slate-200 text-slate-700 text-xs font-bold hover:bg-slate-100 transition-colors shadow-2xs"
+                  >
+                    Today
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowBlockSlotsModal(true);
+                      fetchBlockedSlotsList();
+                    }}
+                    className="px-3 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-600 text-slate-950 text-xs font-extrabold flex items-center space-x-1.5 transition-all shadow-sm active:scale-95"
+                  >
+                    <i className="fa-solid fa-calendar-xmark text-xs"></i>
+                    <span>Mark as Booked</span>
+                  </button>
+
+                  <h3 className="text-sm sm:text-lg font-bold text-slate-900 font-mono pl-1">
+                    {MONTH_NAMES[calMonthIndex]} {calYear}
+                  </h3>
+                </div>
+
+                <div className="flex items-center bg-slate-100 p-1 rounded-xl border border-slate-200 text-xs font-bold self-end sm:self-auto">
+                  <button
+                    onClick={() => setCalViewMode("month")}
+                    className={`px-3.5 py-1 rounded-lg transition-all ${
+                      calViewMode === "month"
+                        ? "bg-white text-indigo-600 shadow-sm font-extrabold"
+                        : "text-slate-500 hover:text-slate-900"
+                    }`}
+                  >
+                    Month
+                  </button>
+                  <button
+                    onClick={() => setCalViewMode("week")}
+                    className={`px-3.5 py-1 rounded-lg transition-all ${
+                      calViewMode === "week"
+                        ? "bg-white text-indigo-600 shadow-sm font-extrabold"
+                        : "text-slate-500 hover:text-slate-900"
+                    }`}
+                  >
+                    Week
+                  </button>
+                </div>
+              </div>
+
+              {calViewMode === "month" && (
+                <div className="space-y-1.5">
+                  <div className="grid grid-cols-7 border-b border-slate-200 text-center py-2 text-[10px] sm:text-xs font-extrabold text-slate-400 tracking-wider bg-slate-50 rounded-xl">
+                    <span>SUN</span>
+                    <span>MON</span>
+                    <span>TUE</span>
+                    <span>WED</span>
+                    <span>THU</span>
+                    <span>FRI</span>
+                    <span>SAT</span>
+                  </div>
+
+                  <div className="grid grid-cols-7 border-l border-t border-slate-200 bg-slate-100 rounded-xl overflow-hidden gap-[1px]">
+                    {calGridCells.map((cell, idx) => {
+                      const dayMeetings = meetingsByDateMap[cell.dateStr] || [];
+                      const isCurrentMonth = cell.monthOffset === 0;
+                      const blockedDateObj = blockedSlotsList.find((b) => b.dateStr === cell.dateStr);
+
+                      return (
+                        <div
+                          key={idx}
+                          onClick={() => {
+                            if (dayMeetings.length > 0) {
+                              setDayMeetingsModalData({
+                                dateStr: cell.dateStr,
+                                meetings: dayMeetings,
+                              });
+                            } else if (blockedDateObj) {
+                              setShowBlockSlotsModal(true);
+                            }
+                          }}
+                          className={`bg-white min-h-[95px] sm:min-h-[125px] p-1.5 flex flex-col justify-between transition-colors relative cursor-pointer ${
+                            !isCurrentMonth ? "bg-slate-50/60" : "hover:bg-indigo-50/20"
+                          }`}
+                        >
+                          <div className="flex items-center justify-between pr-1 pt-0.5">
+                            <div>
+                              {blockedDateObj && (
+                                blockedDateObj.isFullDateBlocked ? (
+                                  <span className="bg-red-100 text-red-800 border border-red-300 text-[9px] font-extrabold px-1.5 py-0.5 rounded-md flex items-center space-x-1 shadow-2xs">
+                                    <span>🚫 BLOCKED</span>
+                                  </span>
+                                ) : (
+                                  <span className="bg-amber-100 text-amber-900 border border-amber-300 text-[9px] font-bold px-1.5 py-0.5 rounded-md flex items-center space-x-1 shadow-2xs">
+                                    <span>⚠️ {blockedDateObj.blockedSlots.length} Blocked</span>
+                                  </span>
+                                )
+                              )}
+                            </div>
+                            <span
+                              className={`text-xs font-mono font-bold ${
+                                cell.isToday
+                                  ? "w-6 h-6 rounded-full bg-indigo-600 text-white flex items-center justify-center shadow-sm"
+                                  : isCurrentMonth
+                                  ? "text-slate-700"
+                                  : "text-slate-300"
+                              }`}
+                            >
+                              {cell.dayNum}
+                            </span>
+                          </div>
+
+                          <div className="space-y-1 my-auto">
+                            {dayMeetings.slice(0, 2).map((m, mIdx) => {
+                              const isPast = isMeetingInPast(m.meetingDate, m.meetingTime);
+                              const shortTime = formatShortTime(m.meetingTime);
+                              const meetUrl = m.meetingUrl || m.meeting?.meetingUrl;
+
+                              return (
+                                <div
+                                  key={mIdx}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleOpenDrawer(m);
+                                  }}
+                                  className={`text-[10px] font-bold p-1 rounded-md cursor-pointer hover:opacity-90 transition-opacity flex flex-col space-y-0.5 shadow-2xs border ${
+                                    isPast
+                                      ? "bg-rose-50 text-rose-800 border-rose-300"
+                                      : "bg-emerald-50 text-emerald-900 border-emerald-300"
+                                  }`}
+                                  title={`${m.fullName} - ${m.meetingTime} (${isPast ? "Time Passed" : "Upcoming"})`}
+                                >
+                                  <div className="flex items-center justify-between">
+                                    <span className="truncate max-w-[70px] sm:max-w-[100px] font-extrabold">
+                                      {m.fullName}
+                                    </span>
+                                    <span className="font-mono text-[9px] opacity-80 flex-shrink-0">
+                                      {shortTime}
+                                    </span>
+                                  </div>
+
+                                  {meetUrl && (
+                                    <a
+                                      href={meetUrl}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      onClick={(e) => e.stopPropagation()}
+                                      className="bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold text-[9px] px-1.5 py-0.5 rounded flex items-center justify-center space-x-1 shadow-2xs transition-colors mt-0.5"
+                                    >
+                                      <i className="fa-solid fa-video text-[8px]"></i>
+                                      <span>Join 🎥</span>
+                                    </a>
+                                  )}
+                                </div>
+                              );
+                            })}
+
+                            {dayMeetings.length > 2 && (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setDayMeetingsModalData({
+                                    dateStr: cell.dateStr,
+                                    meetings: dayMeetings,
+                                  });
+                                }}
+                                className="text-[9px] font-extrabold text-indigo-600 hover:underline block text-left px-1 py-0.5 font-mono"
+                              >
+                                +{dayMeetings.length - 2} more
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {calViewMode === "week" && (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between">
+                    <p className="text-xs text-slate-500 font-semibold">
+                      Full appointment schedule for the active week across daily time slots:
+                    </p>
+                    <span className="text-[10px] font-mono bg-indigo-50 text-indigo-700 px-2 py-0.5 rounded border border-indigo-200 font-bold">
+                      Week Schedule
+                    </span>
+                  </div>
+
+                  <div className="overflow-x-auto rounded-xl border border-slate-200">
+                    <table className="w-full text-left text-xs">
+                      <thead className="bg-slate-50 text-slate-600 font-bold border-b border-slate-200 uppercase text-[10px]">
+                        <tr>
+                          <th className="p-3 border-r border-slate-200">Slot Time</th>
+                          <th className="p-3">Client Info</th>
+                          <th className="p-3">Appointment Date</th>
+                          <th className="p-3">Campaign</th>
+                          <th className="p-3">Status</th>
+                          <th className="p-3 text-right">Action</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100 font-medium">
+                        {allMeetingsList.length === 0 ? (
+                          <tr>
+                            <td colSpan={6} className="p-6 text-center text-slate-400 italic">
+                              No meeting appointments found.
+                            </td>
+                          </tr>
+                        ) : (
+                          allMeetingsList.map((m, mIdx) => (
+                            <tr
+                              key={mIdx}
+                              onClick={() => handleOpenDrawer(m)}
+                              className="hover:bg-indigo-50/40 cursor-pointer transition-colors"
+                            >
+                              <td className="p-3 border-r border-slate-100 font-bold text-indigo-600 font-mono">
+                                {m.meetingTime}
+                              </td>
+                              <td className="p-3">
+                                <div className="font-bold text-slate-900">{m.fullName}</div>
+                                <div className="text-[11px] text-slate-400">{m.email}</div>
+                              </td>
+                              <td className="p-3 font-mono text-slate-700 font-bold">
+                                {m.meetingDate}
+                              </td>
+                              <td className="p-3">
+                                <span className="bg-slate-100 text-slate-700 px-2 py-0.5 rounded text-[10px] font-bold">
+                                  {m.campaign || "firstoptionagency"}
+                                </span>
+                              </td>
+                              <td className="p-3">
+                                <span className="bg-emerald-100 text-emerald-800 text-[10px] font-bold px-2.5 py-0.5 rounded-full border border-emerald-300">
+                                  Booked
+                                </span>
+                              </td>
+                              <td className="p-3 text-right" onClick={(e) => e.stopPropagation()}>
+                                <div className="flex items-center justify-end space-x-2">
+                                  {(m.meetingUrl || m.meeting?.meetingUrl) && (
+                                    <a
+                                      href={m.meetingUrl || m.meeting?.meetingUrl}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="bg-indigo-600 hover:bg-indigo-700 text-white text-[10px] font-extrabold px-3 py-1.5 rounded-lg shadow-2xs transition-colors flex items-center space-x-1.5"
+                                    >
+                                      <i className="fa-solid fa-video text-xs"></i>
+                                      <span>Join Google Meet 🎥</span>
+                                    </a>
+                                  )}
+                                  <button
+                                    onClick={() => handleOpenDrawer(m)}
+                                    className="bg-indigo-50 hover:bg-indigo-100 text-indigo-600 border border-indigo-200 text-[10px] font-bold px-3 py-1.5 rounded-lg transition-colors"
+                                  >
+                                    View Details & Notes
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          ))
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </div>
+          ) : (
+            <>
+              {/* 1. KEY METRICS CARDS */}
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5 sm:gap-4">
+                <div className="bg-white border border-slate-200 rounded-xl sm:rounded-2xl p-3 sm:p-4 shadow-sm space-y-1">
+                  <div className="flex items-center justify-between text-slate-500">
+                    <span className="text-[11px] sm:text-xs font-bold truncate">Total Leads</span>
+                    <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-lg bg-indigo-50 text-indigo-600 flex items-center justify-center text-xs flex-shrink-0">
+                      <i className="fa-solid fa-users"></i>
+                    </div>
+                  </div>
+                  <p className="text-xl sm:text-2xl font-extrabold text-slate-900">{totalLeadsCount}</p>
+                  <p className="text-[9px] sm:text-[10px] text-slate-400 truncate">Leads matching filter</p>
+                </div>
+
+                <div className="bg-white border border-slate-200 rounded-xl sm:rounded-2xl p-3 sm:p-4 shadow-sm space-y-1">
+                  <div className="flex items-center justify-between text-slate-500">
+                    <span className="text-[11px] sm:text-xs font-bold text-amber-700 truncate">Partial Leads</span>
+                    <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-lg bg-amber-50 text-amber-600 flex items-center justify-center text-xs flex-shrink-0">
+                      <i className="fa-solid fa-hourglass-half"></i>
+                    </div>
+                  </div>
+                  <p className="text-xl sm:text-2xl font-extrabold text-amber-600">{partialLeadsCount}</p>
+                  <p className="text-[9px] sm:text-[10px] text-slate-400 truncate">Need survey link</p>
+                </div>
+
+                <div className="bg-white border border-slate-200 rounded-xl sm:rounded-2xl p-3 sm:p-4 shadow-sm space-y-1">
+                  <div className="flex items-center justify-between text-slate-500">
+                    <span className="text-[11px] sm:text-xs font-bold text-blue-700 truncate">Survey Done</span>
+                    <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-lg bg-blue-50 text-blue-600 flex items-center justify-center text-xs flex-shrink-0">
+                      <i className="fa-solid fa-clipboard-check"></i>
+                    </div>
+                  </div>
+                  <p className="text-xl sm:text-2xl font-extrabold text-blue-600">{surveyCompletedCount}</p>
+                  <p className="text-[9px] sm:text-[10px] text-slate-400 truncate">Survey completed</p>
+                </div>
+
+                <div className="bg-white border border-slate-200 rounded-xl sm:rounded-2xl p-3 sm:p-4 shadow-sm space-y-1">
+                  <div className="flex items-center justify-between text-slate-500">
+                    <span className="text-[11px] sm:text-xs font-bold text-emerald-700 truncate">Meetings</span>
+                    <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-lg bg-emerald-50 text-emerald-600 flex items-center justify-center text-xs flex-shrink-0">
+                      <i className="fa-solid fa-calendar-day"></i>
+                    </div>
+                  </div>
+                  <p className="text-xl sm:text-2xl font-extrabold text-emerald-600">{todayMeetingsScheduled}</p>
+                  <p className="text-[9px] sm:text-[10px] text-slate-400 truncate">Upcoming / Filtered</p>
+                </div>
+              </div>
+
+              {/* 2. VISUAL LEAD ACQUISITION FUNNEL */}
+              <div className="bg-white border border-slate-200 rounded-xl sm:rounded-2xl p-3.5 sm:p-5 shadow-sm space-y-3">
+                <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
+                  <div>
+                    <h3 className="text-xs sm:text-sm font-bold text-slate-900">
+                      Lead Acquisition Conversion Funnel
+                    </h3>
+                    <p className="text-[10px] sm:text-xs text-slate-500">
+                      Customer journey conversion rate from form to booked meeting
+                    </p>
+                  </div>
+
+                  <span className="text-[10px] sm:text-xs font-bold bg-indigo-50 text-indigo-600 px-2 py-0.5 sm:px-2.5 sm:py-1 rounded-full">
+                    {bookedPct}% Conversion
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 sm:gap-3">
+                  <div className="bg-slate-50 border border-slate-200 rounded-xl p-2.5 sm:p-3 space-y-1.5">
+                    <div className="flex items-center justify-between text-xs font-bold text-slate-700">
+                      <span>1. Contact Form</span>
+                      <span className="text-indigo-600 font-mono">{totalLeadsCount} Leads</span>
+                    </div>
+                    <div className="w-full bg-slate-200 rounded-full h-1.5 sm:h-2 overflow-hidden">
+                      <div className="bg-indigo-600 h-full rounded-full w-full" />
+                    </div>
+                    <div className="text-[9px] text-slate-400">100% captured</div>
+                  </div>
+
+                  <div className="bg-slate-50 border border-slate-200 rounded-xl p-2.5 sm:p-3 space-y-1.5">
+                    <div className="flex items-center justify-between text-xs font-bold text-slate-700">
+                      <span>2. Survey Done</span>
+                      <span className="text-blue-600 font-mono">{surveyCompletedCount} Leads</span>
+                    </div>
+                    <div className="w-full bg-slate-200 rounded-full h-1.5 sm:h-2 overflow-hidden">
+                      <div
+                        className="bg-blue-600 h-full rounded-full transition-all duration-500"
+                        style={{ width: `${surveyPct}%` }}
+                      />
+                    </div>
+                    <div className="text-[9px] text-slate-400">{surveyPct}% completion rate</div>
+                  </div>
+
+                  <div className="bg-slate-50 border border-slate-200 rounded-xl p-2.5 sm:p-3 space-y-1.5">
+                    <div className="flex items-center justify-between text-xs font-bold text-slate-700">
+                      <span>3. Growth Call</span>
+                      <span className="text-emerald-600 font-mono">{bookedMeetingsCount} Meetings</span>
+                    </div>
+                    <div className="w-full bg-slate-200 rounded-full h-1.5 sm:h-2 overflow-hidden">
+                      <div
+                        className="bg-emerald-600 h-full rounded-full transition-all duration-500"
+                        style={{ width: `${bookedPct}%` }}
+                      />
+                    </div>
+                    <div className="text-[9px] text-slate-400">{bookedPct}% final conversion</div>
+                  </div>
+                </div>
+              </div>
+
+              {/* 3. TABBED DATA CONTAINER */}
+              <div className="bg-white border border-slate-200 rounded-xl sm:rounded-2xl shadow-sm overflow-hidden">
+                <div className="px-3 py-2.5 sm:px-6 border-b border-slate-200 flex flex-col md:flex-row md:items-center justify-between gap-2.5 bg-slate-50/50">
+                  <div className="flex items-center space-x-2">
+                    <button
+                      onClick={() => changeTab("leads")}
+                      className={`flex-1 sm:flex-none px-3 py-1.5 rounded-xl text-xs font-bold transition-all text-center ${
+                        activeTab === "leads"
+                          ? "bg-white text-indigo-600 shadow-sm border border-slate-200"
+                          : "text-slate-500 hover:text-slate-800"
+                      }`}
+                    >
+                      Leads ({totalLeadsCount})
+                    </button>
+
+                    <button
+                      onClick={() => changeTab("meetings")}
+                      className={`flex-1 sm:flex-none px-3 py-1.5 rounded-xl text-xs font-bold transition-all text-center ${
+                        activeTab === "meetings"
+                          ? "bg-white text-indigo-600 shadow-sm border border-slate-200"
+                          : "text-slate-500 hover:text-slate-800"
+                      }`}
+                    >
+                      Meetings ({todayMeetingsScheduled})
+                    </button>
+                  </div>
+
+                  {activeTab === "leads" && (
+                    <div className="flex items-center space-x-2 flex-wrap gap-y-2">
+                      <select
+                        value={leadsDatePreset}
+                        onChange={(e) => setLeadsDatePreset(e.target.value as any)}
+                        className="bg-white border border-slate-300 rounded-xl px-2.5 py-1 text-xs font-bold text-slate-800 focus:outline-none"
+                      >
+                        <option value="last_7_days">⚡ Last 7 Days (Default)</option>
+                        <option value="today">☀️ Today</option>
+                        <option value="yesterday">⏪ Yesterday</option>
+                        <option value="specific_date">🎯 Specific Day</option>
+                        <option value="custom_range">📆 Custom Date Range</option>
+                        <option value="all_time">🌐 All Time</option>
+                      </select>
+
+                      {leadsDatePreset === "specific_date" && (
+                        <input
+                          type="date"
+                          value={leadsSingleDate}
+                          onChange={(e) => setLeadsSingleDate(e.target.value)}
+                          className="bg-white border border-slate-300 rounded-xl px-2 py-1 text-xs font-bold text-slate-900 focus:outline-none focus:border-indigo-600"
+                        />
+                      )}
+
+                      {leadsDatePreset === "custom_range" && (
+                        <div className="flex items-center space-x-1 text-[10px] font-bold text-slate-500">
+                          <span>Start:</span>
+                          <input
+                            type="date"
+                            value={leadsStartDate}
+                            onChange={(e) => setLeadsStartDate(e.target.value)}
+                            className="bg-white border border-slate-300 rounded-xl px-1.5 py-1 text-xs font-bold text-slate-900 focus:outline-none"
+                          />
+                          <span>End:</span>
+                          <input
+                            type="date"
+                            value={leadsEndDate}
+                            onChange={(e) => setLeadsEndDate(e.target.value)}
+                            className="bg-white border border-slate-300 rounded-xl px-1.5 py-1 text-xs font-bold text-slate-900 focus:outline-none"
+                          />
+                        </div>
+                      )}
+
+                      <select
+                        value={statusFilter}
+                        onChange={(e) => setStatusFilter(e.target.value)}
+                        className="bg-white border border-slate-300 rounded-xl px-2 py-1 text-xs text-slate-800 font-semibold focus:outline-none"
+                      >
+                        <option value="all">All Status</option>
+                        <option value="partial">Partial</option>
+                        <option value="survey_completed">Survey</option>
+                        <option value="completed">Booked</option>
+                      </select>
+
+                      <input
+                        type="text"
+                        placeholder="Search name or phone..."
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                        className="bg-white border border-slate-300 rounded-xl px-3 py-1 text-xs text-slate-800 placeholder-slate-400 focus:outline-none focus:border-indigo-600 flex-1 sm:w-44"
+                      />
+                    </div>
+                  )}
+
+                  {activeTab === "meetings" && (
+                    <div className="flex items-center space-x-2 flex-wrap gap-y-2">
+                      <select
+                        value={meetingsDatePreset}
+                        onChange={(e) => setMeetingsDatePreset(e.target.value as any)}
+                        className="bg-white border border-slate-300 rounded-xl px-2.5 py-1 text-xs font-bold text-slate-800 focus:outline-none"
+                      >
+                        <option value="upcoming_7_days">🔮 Upcoming 7 Days (Default)</option>
+                        <option value="today">☀️ Today</option>
+                        <option value="tomorrow">⏩ Tomorrow</option>
+                        <option value="specific_date">🎯 Specific Day</option>
+                        <option value="custom_range">📆 Custom Date Range</option>
+                        <option value="all_time">🌐 All Time</option>
+                      </select>
+
+                      {meetingsDatePreset === "specific_date" && (
+                        <input
+                          type="date"
+                          value={meetingsSingleDate}
+                          onChange={(e) => setMeetingsSingleDate(e.target.value)}
+                          className="bg-white border border-slate-300 rounded-xl px-2 py-1 text-xs font-bold text-slate-900 focus:outline-none focus:border-indigo-600"
+                        />
+                      )}
+
+                      {meetingsDatePreset === "custom_range" && (
+                        <div className="flex items-center space-x-1 text-[10px] font-bold text-slate-500">
+                          <span>Start:</span>
+                          <input
+                            type="date"
+                            value={meetingsStartDate}
+                            onChange={(e) => setMeetingsStartDate(e.target.value)}
+                            className="bg-white border border-slate-300 rounded-xl px-1.5 py-1 text-xs font-bold text-slate-900 focus:outline-none"
+                          />
+                          <span>End:</span>
+                          <input
+                            type="date"
+                            value={meetingsEndDate}
+                            onChange={(e) => setMeetingsEndDate(e.target.value)}
+                            className="bg-white border border-slate-300 rounded-xl px-1.5 py-1 text-xs font-bold text-slate-900 focus:outline-none"
+                          />
+                        </div>
+                      )}
+
+                      <input
+                        type="text"
+                        placeholder="Search name or phone..."
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                        className="bg-white border border-slate-300 rounded-xl px-3 py-1 text-xs text-slate-800 placeholder-slate-400 focus:outline-none focus:border-indigo-600 flex-1 sm:w-44"
+                      />
+                    </div>
+                  )}
+                </div>
+
+                {/* TAB 1: LEADS CONTENT */}
+                {activeTab === "leads" && (
+                  <div>
+                    {filteredLeads.length === 0 ? (
+                      <div className="p-8 text-center space-y-2">
+                        <i className="fa-solid fa-inbox text-3xl text-slate-300"></i>
+                        <p className="text-xs text-slate-500 font-bold">
+                          No leads found matching selected date filter
+                        </p>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="block md:hidden divide-y divide-slate-100">
+                          {filteredLeads.map((lead) => {
+                            const whatsappSurveyUrl = `https://api.whatsapp.com/send?phone=${
+                              lead.countryCode ? lead.countryCode.replace("+", "") : "91"
+                            }${lead.phone}&text=${encodeURIComponent(
+                              `Hi ${lead.fullName || "there"}, thanks for requesting a consultation with First Option Agency! Please complete your 30-second business survey here to lock your call: ${
+                                lead.links?.surveyUrl || `${window.location.origin}/?step=survey&leadId=${lead.id}&createdDate=${lead.createdDate}`
+                              }`
+                            )}`;
+
+                            const isSurveyDone =
+                              lead.status === "survey_completed" || lead.status === "completed" || (lead.survey && Object.keys(lead.survey).length > 0);
+                            const isMeetingDone = lead.status === "completed" || !!lead.meeting?.meetingDate;
+
+                            return (
+                              <div
+                                key={lead.id}
+                                onClick={() => handleOpenDrawer(lead)}
+                                className="p-3.5 space-y-2.5 bg-white hover:bg-indigo-50/30 transition-colors cursor-pointer"
+                              >
+                                <div className="flex items-start justify-between gap-2">
+                                  <div className="flex items-center space-x-2.5 truncate">
+                                    <div className="w-9 h-9 rounded-xl bg-indigo-600 text-white font-bold text-sm flex items-center justify-center shadow-sm flex-shrink-0">
+                                      {lead.fullName?.charAt(0).toUpperCase() || "L"}
+                                    </div>
+                                    <div className="truncate">
+                                      <h4 className="text-sm font-bold text-slate-900 truncate leading-snug">
+                                        {lead.fullName || "Anonymous"}
+                                      </h4>
+                                      <p className="text-[11px] text-slate-400 truncate">{lead.email}</p>
+                                    </div>
+                                  </div>
+
+                                  <div className="flex flex-col items-end space-y-1">
+
+                                    <span
+                                      className={`px-2 py-0.5 rounded-full font-bold text-[10px] ${
+                                        lead.status === "completed"
+                                          ? "bg-emerald-100 text-emerald-800 border border-emerald-300"
+                                          : lead.status === "survey_completed"
+                                          ? "bg-blue-100 text-blue-800 border border-blue-300"
+                                          : "bg-amber-100 text-amber-800 border border-amber-300"
+                                      }`}
+                                    >
+                                      {lead.status === "completed"
+                                        ? "Call Booked"
+                                        : lead.status === "survey_completed"
+                                        ? "Survey Done"
+                                        : "Partial"}
+                                    </span>
+                                  </div>
+                                </div>
+
+                                <div className="flex items-center space-x-1 text-[10px] font-bold flex-wrap gap-y-1">
+                                  <span className="bg-emerald-100 text-emerald-800 border border-emerald-300 px-2 py-0.5 rounded">
+                                    ✓ Detail
+                                  </span>
+                                  <span className="text-slate-300 font-mono">›</span>
+                                  <span
+                                    className={`px-2 py-0.5 rounded ${
+                                      isSurveyDone
+                                        ? "bg-emerald-100 text-emerald-800 border border-emerald-300"
+                                        : "bg-red-100 text-red-700 border border-red-300"
+                                    }`}
+                                  >
+                                    {isSurveyDone ? "✓ Survey" : "✗ Survey"}
+                                  </span>
+                                  <span className="text-slate-300 font-mono">›</span>
+                                  <span
+                                    className={`px-2 py-0.5 rounded ${
+                                      isMeetingDone
+                                        ? "bg-emerald-100 text-emerald-800 border border-emerald-300"
+                                        : "bg-red-100 text-red-700 border border-red-300"
+                                    }`}
+                                  >
+                                    {isMeetingDone ? "✓ Meeting" : "✗ Meeting"}
+                                  </span>
+                                </div>
+
+                                {(lead.followUpDate || (lead.notes && lead.notes.length > 0)) && (
+                                  <div className="flex items-center space-x-2 pt-0.5 flex-wrap gap-1">
+                                    {lead.followUpDate && (
+                                      <div className="text-[10px] font-extrabold text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded border border-indigo-200 w-fit flex items-center space-x-1">
+                                        <i className="fa-regular fa-calendar text-[10px]"></i>
+                                        <span>Follow-up: {lead.followUpDate}</span>
+                                      </div>
+                                    )}
+
+                                    {lead.notes && lead.notes.length > 0 && (
+                                      <div className="text-[10px] font-bold text-slate-700 bg-slate-100 px-2 py-0.5 rounded border border-slate-200 w-fit flex items-center space-x-1">
+                                        <i className="fa-solid fa-note-sticky text-amber-500 text-[10px]"></i>
+                                        <span>{lead.notes.length} Staff Note{lead.notes.length > 1 ? "s" : ""}</span>
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
+
+                                <div className="grid grid-cols-3 gap-2 pt-1" onClick={(e) => e.stopPropagation()}>
+                                  <a
+                                    href={`tel:${lead.countryCode || "+91"}${lead.phone}`}
+                                    className="flex items-center justify-center space-x-1 bg-slate-100 hover:bg-slate-200 text-slate-800 py-1.5 rounded-xl text-[11px] font-bold transition-colors border border-slate-200"
+                                  >
+                                    <i className="fa-solid fa-phone text-xs text-indigo-600"></i>
+                                    <span>Call</span>
+                                  </a>
+
+                                  {lead.status === "partial" ? (
+                                    <a
+                                      href={whatsappSurveyUrl}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="flex items-center justify-center space-x-1 bg-emerald-600 hover:bg-emerald-700 text-white py-1.5 rounded-xl text-[11px] font-bold transition-colors shadow-sm"
+                                    >
+                                      <i className="fa-brands fa-whatsapp text-xs"></i>
+                                      <span>Send Survey</span>
+                                    </a>
+                                  ) : (
+                                    <a
+                                      href={`https://api.whatsapp.com/send?phone=${lead.countryCode ? lead.countryCode.replace("+", "") : "91"}${lead.phone}`}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="flex items-center justify-center space-x-1 bg-emerald-600 hover:bg-emerald-700 text-white py-1.5 rounded-xl text-[11px] font-bold transition-colors shadow-sm"
+                                    >
+                                      <i className="fa-brands fa-whatsapp text-xs"></i>
+                                      <span>WhatsApp</span>
+                                    </a>
+                                  )}
+
+                                  <button
+                                    type="button"
+                                    onClick={() => handleOpenDrawer(lead)}
+                                    className="flex items-center justify-center space-x-1 bg-indigo-600 hover:bg-indigo-700 text-white py-1.5 rounded-xl text-[11px] font-bold transition-colors shadow-sm"
+                                  >
+                                    <span>Details</span>
+                                    <i className="fa-solid fa-chevron-right text-[10px]"></i>
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+
+                        {/* DESKTOP TABLE VIEW FOR LEADS */}
+                        <div className="hidden md:block overflow-x-auto">
+                          <table className="w-full text-left text-xs text-slate-700">
+                            <thead className="bg-slate-50 text-slate-500 font-bold border-b border-slate-200 uppercase text-[10px] tracking-wider">
+                              <tr>
+                                <th className="px-4 py-3">Lead Info</th>
+                                <th className="px-4 py-3">Mobile Number</th>
+                                <th className="px-4 py-3">Step Progress & Remarks</th>
+                                <th className="px-4 py-3">Survey Responses</th>
+                                <th className="px-4 py-3">Time</th>
+                                <th className="px-4 py-3 text-right">Quick Action</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-100 font-medium">
+                              {filteredLeads.map((lead) => {
+                                const whatsappSurveyUrl = `https://api.whatsapp.com/send?phone=${
+                                  lead.countryCode ? lead.countryCode.replace("+", "") : "91"
+                                }${lead.phone}&text=${encodeURIComponent(
+                                  `Hi ${lead.fullName || "there"}, thanks for requesting a consultation with First Option Agency! Please complete your 30-second business survey here to lock your call: ${
+                                    lead.links?.surveyUrl || `${window.location.origin}/?step=survey&leadId=${lead.id}&createdDate=${lead.createdDate}`
+                                  }`
+                                )}`;
+
+                                const isSurveyDone =
+                                  lead.status === "survey_completed" || lead.status === "completed" || (lead.survey && Object.keys(lead.survey).length > 0);
+                                const isMeetingDone = lead.status === "completed" || !!lead.meeting?.meetingDate;
+
+                                return (
+                                  <tr
+                                    key={lead.id}
+                                    onClick={() => handleOpenDrawer(lead)}
+                                    className="hover:bg-indigo-50/40 cursor-pointer transition-colors group"
+                                  >
+                                    <td className="px-4 py-3">
+                                      <div className="font-bold text-slate-900 group-hover:text-indigo-600 flex items-center space-x-1.5">
+                                        <span>{lead.fullName || "Anonymous"}</span>
+                                      </div>
+                                      <div className="text-[11px] text-slate-400">{lead.email}</div>
+                                    </td>
+
+                                    <td className="px-4 py-3 font-mono font-semibold">
+                                      {lead.countryCode} {lead.phone}
+                                    </td>
+
+                                    <td className="px-4 py-3">
+                                      <div className="flex flex-col space-y-1">
+                                        <div className="flex items-center space-x-1 text-[11px] font-bold flex-wrap gap-y-1">
+                                          <span className="bg-emerald-100 text-emerald-800 border border-emerald-300 px-2 py-0.5 rounded-md flex items-center space-x-1">
+                                            <span>✓ Fill Detail</span>
+                                          </span>
+
+                                          <span className="text-slate-300 font-mono">›</span>
+
+                                          {isSurveyDone ? (
+                                            <span className="bg-emerald-100 text-emerald-800 border border-emerald-300 px-2 py-0.5 rounded-md flex items-center space-x-1">
+                                              <span>✓ Fill Survey</span>
+                                            </span>
+                                          ) : (
+                                            <span className="bg-red-100 text-red-700 border border-red-300 px-2 py-0.5 rounded-md flex items-center space-x-1">
+                                              <span>✗ Fill Survey</span>
+                                            </span>
+                                          )}
+
+                                          <span className="text-slate-300 font-mono">›</span>
+
+                                          {isMeetingDone ? (
+                                            <span className="bg-emerald-100 text-emerald-800 border border-emerald-300 px-2 py-0.5 rounded-md flex items-center space-x-1 shadow-sm">
+                                              <i className="fa-regular fa-calendar-check text-[10px]"></i>
+                                              <span>
+                                                ✓ Booked Meeting{" "}
+                                                {lead.meeting?.meetingDate && lead.meeting?.meetingTime
+                                                  ? `(${lead.meeting.meetingDate} @ ${lead.meeting.meetingTime})`
+                                                  : ""}
+                                              </span>
+                                            </span>
+                                          ) : (
+                                            <span className="bg-red-100 text-red-700 border border-red-300 px-2 py-0.5 rounded-md flex items-center space-x-1">
+                                              <span>✗ Booked Meeting</span>
+                                            </span>
+                                          )}
+                                        </div>
+
+                                        <div className="flex items-center space-x-2 pt-0.5 flex-wrap gap-1">
+                                          {lead.followUpDate && (
+                                            <div className="text-[10px] font-extrabold text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded border border-indigo-200 w-fit flex items-center space-x-1">
+                                              <i className="fa-regular fa-calendar text-[10px]"></i>
+                                              <span>Follow-up: {lead.followUpDate}</span>
+                                            </div>
+                                          )}
+
+                                          {lead.notes && lead.notes.length > 0 && (
+                                            <div className="text-[10px] font-bold text-slate-700 bg-slate-100 px-2 py-0.5 rounded border border-slate-200 w-fit flex items-center space-x-1">
+                                              <i className="fa-solid fa-note-sticky text-amber-500 text-[10px]"></i>
+                                              <span>{lead.notes.length} Staff Note{lead.notes.length > 1 ? "s" : ""}</span>
+                                            </div>
+                                          )}
+                                        </div>
+                                      </div>
+                                    </td>
+
+                                    <td className="px-4 py-3 max-w-xs">
+                                      {lead.survey ? (
+                                        <div className="space-y-0.5 text-[11px]">
+                                          {Object.keys(lead.survey).map((key) => (
+                                            <div key={key} className="truncate">
+                                              <span className="text-slate-400 capitalize">{key}:</span>{" "}
+                                              <span className="font-bold text-slate-800">{lead.survey![key]}</span>
+                                            </div>
+                                          ))}
+                                        </div>
+                                      ) : (
+                                        <span className="text-slate-400 italic">No survey filled</span>
+                                      )}
+                                    </td>
+
+                                    <td className="px-4 py-3 text-slate-500 text-[11px] font-mono">
+                                      {lead.updatedAt ? new Date(lead.updatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : "N/A"}
+                                    </td>
+
+                                    <td className="px-4 py-3 text-right" onClick={(e) => e.stopPropagation()}>
+                                      <div className="flex items-center justify-end space-x-2">
+                                        <button
+                                          type="button"
+                                          onClick={() => handleOpenLeadLogsModal(lead)}
+                                          className="inline-flex items-center space-x-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 px-2.5 py-1 rounded-lg text-[11px] font-bold transition-colors border border-indigo-200 shadow-sm"
+                                        >
+                                          <i className="fa-solid fa-scroll text-xs"></i>
+                                          <span>Logs</span>
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => handleOpenDrawer(lead)}
+                                          className="inline-flex items-center space-x-1 bg-slate-100 hover:bg-slate-200 text-slate-700 px-2.5 py-1 rounded-lg text-[11px] font-bold transition-colors border border-slate-200"
+                                        >
+                                          <i className="fa-solid fa-sidebar text-xs"></i>
+                                          <span>Details</span>
+                                        </button>
+
+                                        {lead.status === "partial" ? (
+                                          <a
+                                            href={whatsappSurveyUrl}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="inline-flex items-center space-x-1.5 bg-emerald-600 hover:bg-emerald-700 text-white px-2.5 py-1 rounded-lg text-[11px] font-bold transition-colors shadow-sm"
+                                          >
+                                            <i className="fa-brands fa-whatsapp text-xs"></i>
+                                            <span>Send Survey</span>
+                                          </a>
+                                        ) : (
+                                          <a
+                                            href={`https://api.whatsapp.com/send?phone=${lead.countryCode ? lead.countryCode.replace("+", "") : "91"}${lead.phone}`}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="inline-flex items-center space-x-1 bg-slate-100 hover:bg-slate-200 text-slate-700 px-2.5 py-1 rounded-lg text-[11px] font-bold transition-colors"
+                                          >
+                                            <i className="fa-brands fa-whatsapp text-emerald-600"></i>
+                                            <span>Chat</span>
+                                          </a>
+                                        )}
+                                      </div>
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                )}
+
+                {/* TAB 2: MEETINGS CONTENT */}
+                {activeTab === "meetings" && (
+                  <div>
+                    {filteredMeetings.length === 0 ? (
+                      <div className="p-8 text-center space-y-2">
+                        <i className="fa-solid fa-calendar-xmark text-3xl text-slate-300"></i>
+                        <p className="text-xs text-slate-500 font-bold">
+                          No scheduled meetings found matching selected date filter
+                        </p>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="block md:hidden divide-y divide-slate-100">
+                          {filteredMeetings.map((m, idx) => (
+                            <div
+                              key={idx}
+                              onClick={() => handleOpenDrawer(m)}
+                              className="p-3.5 space-y-2.5 bg-white hover:bg-indigo-50/30 transition-colors cursor-pointer"
+                            >
+                              <div className="flex items-center justify-between">
+                                <span className="bg-indigo-100 text-indigo-900 font-black px-2.5 py-0.5 rounded-lg text-xs border border-indigo-200">
+                                  🕒 {m.meetingTime}
+                                </span>
+                                <span className="text-[10px] text-slate-500 font-mono font-bold">
+                                  📅 {m.meetingDate}
+                                </span>
+                              </div>
+
+                              <div className="flex items-center space-x-2.5">
+                                <div className="w-9 h-9 rounded-xl bg-indigo-600 text-white font-bold text-sm flex items-center justify-center shadow-sm flex-shrink-0">
+                                  {m.fullName?.charAt(0).toUpperCase() || "M"}
+                                </div>
+                                <div className="truncate">
+                                  <h4 className="text-sm font-bold text-slate-900 truncate leading-snug">{m.fullName}</h4>
+                                  <p className="text-[11px] text-slate-400 truncate">{m.email}</p>
+                                </div>
+                              </div>
+
+                              {(m.followUpDate || (m.notes && m.notes.length > 0)) && (
+                                <div className="flex items-center space-x-2 pt-0.5 flex-wrap gap-1">
+                                  {m.followUpDate && (
+                                    <div className="text-[10px] font-extrabold text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded border border-indigo-200 w-fit flex items-center space-x-1">
+                                      <i className="fa-regular fa-calendar text-[10px]"></i>
+                                      <span>Follow-up: {m.followUpDate}</span>
+                                    </div>
+                                  )}
+
+                                  {m.notes && m.notes.length > 0 && (
+                                    <div className="text-[10px] font-bold text-slate-700 bg-slate-100 px-2 py-0.5 rounded border border-slate-200 w-fit flex items-center space-x-1">
+                                      <i className="fa-solid fa-note-sticky text-amber-500 text-[10px]"></i>
+                                      <span>{m.notes.length} Staff Note{m.notes.length > 1 ? "s" : ""}</span>
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+
+                              <div className="grid grid-cols-3 gap-2 pt-1" onClick={(e) => e.stopPropagation()}>
+                                <a
+                                  href={`tel:${m.countryCode || "+91"}${m.phone}`}
+                                  className="flex items-center justify-center space-x-1 bg-slate-100 hover:bg-slate-200 text-slate-800 py-1.5 rounded-xl text-[11px] font-bold transition-colors border border-slate-200"
+                                >
+                                  <i className="fa-solid fa-phone text-xs text-indigo-600"></i>
+                                  <span>Call</span>
+                                </a>
+
+                                <a
+                                  href={`https://api.whatsapp.com/send?phone=${
+                                    m.countryCode ? m.countryCode.replace("+", "") : "91"
+                                  }${m.phone}&text=${encodeURIComponent(
+                                    `Hi ${m.fullName}, reminder for our Strategy Call scheduled on ${m.meetingDate} at ${m.meetingTime}.`
+                                  )}`}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="flex items-center justify-center space-x-1 bg-emerald-600 hover:bg-emerald-700 text-white py-1.5 rounded-xl text-[11px] font-bold transition-colors shadow-sm"
+                                >
+                                  <i className="fa-brands fa-whatsapp text-xs"></i>
+                                  <span>Reminder</span>
+                                </a>
+
+                                <button
+                                  type="button"
+                                  onClick={() => handleOpenDrawer(m)}
+                                  className="flex items-center justify-center space-x-1 bg-indigo-600 hover:bg-indigo-700 text-white py-1.5 rounded-xl text-[11px] font-bold transition-colors shadow-sm"
+                                >
+                                  <span>Details</span>
+                                  <i className="fa-solid fa-chevron-right text-[10px]"></i>
+                                </button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+
+                        {/* DESKTOP TABLE VIEW FOR MEETINGS */}
+                        <div className="hidden md:block overflow-x-auto">
+                          <table className="w-full text-left text-xs text-slate-700">
+                            <thead className="bg-slate-50 text-slate-500 font-bold border-b border-slate-200 uppercase text-[10px] tracking-wider">
+                              <tr>
+                                <th className="px-4 py-3">Time Slot</th>
+                                <th className="px-4 py-3">Client Info</th>
+                                <th className="px-4 py-3">Mobile Number</th>
+                                <th className="px-4 py-3">Campaign & Staff Remarks</th>
+                                <th className="px-4 py-3">Survey Profile</th>
+                                <th className="px-4 py-3 text-right">Action</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-100 font-medium">
+                              {filteredMeetings.map((m, idx) => (
+                                <tr
+                                  key={idx}
+                                  onClick={() => handleOpenDrawer(m)}
+                                  className="hover:bg-indigo-50/40 cursor-pointer transition-colors group"
+                                >
+                                  <td className="px-4 py-3">
+                                    <div className="space-y-0.5">
+                                      <span className="bg-indigo-100 text-indigo-900 font-black px-2.5 py-1 rounded-lg text-xs border border-indigo-200 block w-fit">
+                                        {m.meetingTime}
+                                      </span>
+                                      <div className="text-[10px] text-slate-500 font-mono font-bold">
+                                        {m.meetingDate}
+                                      </div>
+                                    </div>
+                                  </td>
+
+                                  <td className="px-4 py-3">
+                                    <div className="font-bold text-slate-900 group-hover:text-indigo-600 flex items-center space-x-1">
+                                      <span>{m.fullName}</span>
+                                      <i className="fa-solid fa-chevron-right text-[10px] text-slate-300 group-hover:text-indigo-600 transition-colors"></i>
+                                    </div>
+                                    <div className="text-[11px] text-slate-400">{m.email}</div>
+                                  </td>
+
+                                  <td className="px-4 py-3 font-mono font-semibold">
+                                    {m.countryCode} {m.phone}
+                                  </td>
+
+                                  <td className="px-4 py-3 space-y-1">
+                                    <span className="bg-slate-100 text-slate-700 px-2 py-0.5 rounded text-[10px] font-bold block w-fit">
+                                      {m.campaign || "firstoptionagency"}
+                                    </span>
+
+                                    {m.followUpDate && (
+                                      <div className="text-[10px] font-bold text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded border border-indigo-200 w-fit flex items-center space-x-1">
+                                        <i className="fa-regular fa-calendar"></i>
+                                        <span>Follow-up: {m.followUpDate}</span>
+                                      </div>
+                                    )}
+
+                                    {m.notes && m.notes.length > 0 && (
+                                      <div className="text-[10px] font-bold text-slate-700 bg-slate-100 px-2 py-0.5 rounded border border-slate-200 w-fit flex items-center space-x-1">
+                                        <i className="fa-solid fa-note-sticky text-amber-500"></i>
+                                        <span>{m.notes.length} Staff Note{m.notes.length > 1 ? "s" : ""}</span>
+                                      </div>
+                                    )}
+                                  </td>
+
+                                  <td className="px-4 py-3 max-w-xs">
+                                    {m.survey ? (
+                                      <div className="space-y-0.5 text-[11px]">
+                                        {Object.keys(m.survey).map((key) => (
+                                          <div key={key} className="truncate">
+                                            <span className="text-slate-400 capitalize font-medium">{key}:</span>{" "}
+                                            <span className="font-bold text-slate-800">{m.survey[key]}</span>
+                                          </div>
+                                        ))}
+                                      </div>
+                                    ) : (
+                                      <span className="text-slate-400 italic">No survey</span>
+                                    )}
+                                  </td>
+
+                                  <td className="px-4 py-3 text-right" onClick={(e) => e.stopPropagation()}>
+                                    <div className="flex items-center justify-end space-x-2">
+                                      <button
+                                        type="button"
+                                        onClick={() => handleOpenDrawer(m)}
+                                        className="inline-flex items-center space-x-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 px-2.5 py-1 rounded-lg text-[11px] font-bold transition-colors border border-indigo-200"
+                                      >
+                                        <i className="fa-solid fa-note-sticky text-xs"></i>
+                                        <span>Details & Notes</span>
+                                      </button>
+
+                                      <a
+                                        href={`https://api.whatsapp.com/send?phone=${m.countryCode ? m.countryCode.replace("+", "") : "91"}${m.phone}&text=${encodeURIComponent(
+                                          `Hi ${m.fullName}, reminder for our Strategy Call scheduled on ${m.meetingDate} at ${m.meetingTime}.`
+                                        )}`}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="inline-flex items-center space-x-1.5 bg-emerald-600 hover:bg-emerald-700 text-white px-2.5 py-1 rounded-lg text-[11px] font-bold transition-colors shadow-sm"
+                                      >
+                                        <i className="fa-brands fa-whatsapp text-xs"></i>
+                                        <span>Reminder</span>
+                                      </a>
+                                    </div>
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+        </main>
+      </div>
+
+
+      {/* DAY MEETINGS LIST MODAL POPUP */}
+      {dayMeetingsModalData && (
+        <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4">
+          <div
+            className="fixed inset-0"
+            onClick={() => setDayMeetingsModalData(null)}
+          />
+          <div className="relative w-full max-w-lg bg-white rounded-3xl shadow-2xl overflow-hidden font-sans border border-slate-200 z-10 animate-in fade-in zoom-in duration-150">
+            <div className="px-5 py-4 border-b border-slate-200 bg-slate-50 flex items-center justify-between">
+              <div>
+                <h3 className="text-base font-extrabold text-slate-900 flex items-center space-x-2">
+                  <i className="fa-solid fa-calendar-day text-indigo-600"></i>
+                  <span>Appointments for {dayMeetingsModalData.dateStr}</span>
+                </h3>
+                <p className="text-xs text-slate-500 font-medium">
+                  {dayMeetingsModalData.meetings.length} strategy call appointment{dayMeetingsModalData.meetings.length > 1 ? "s" : ""}
+                </p>
+              </div>
+
+              <button
+                onClick={() => setDayMeetingsModalData(null)}
+                className="w-8 h-8 rounded-full text-slate-400 hover:text-slate-900 hover:bg-slate-200 flex items-center justify-center transition-colors"
+              >
+                <i className="fa-solid fa-xmark text-sm"></i>
+              </button>
+            </div>
+
+            <div className="p-4 space-y-3 max-h-[60vh] overflow-y-auto">
+              {dayMeetingsModalData.meetings.map((m, idx) => {
+                const isPast = isMeetingInPast(m.meetingDate, m.meetingTime);
+
+                return (
+                  <div
+                    key={idx}
+                    onClick={() => {
+                      setDayMeetingsModalData(null);
+                      handleOpenDrawer(m);
+                    }}
+                    className={`p-3.5 rounded-2xl border transition-all cursor-pointer hover:shadow-md ${
+                      isPast
+                        ? "bg-rose-50/50 border-rose-200 hover:border-rose-300"
+                        : "bg-emerald-50/50 border-emerald-200 hover:border-emerald-300"
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center space-x-2">
+                        <span
+                          className={`text-xs font-mono font-extrabold px-2.5 py-1 rounded-lg border ${
+                            isPast
+                              ? "bg-rose-100 text-rose-800 border-rose-300"
+                              : "bg-emerald-100 text-emerald-800 border-emerald-300"
+                          }`}
+                        >
+                          🕒 {m.meetingTime}
+                        </span>
+
+                        <span
+                          className={`text-[10px] font-extrabold px-2 py-0.5 rounded-full border ${
+                            isPast
+                              ? "bg-rose-100 text-rose-700 border-rose-200"
+                              : "bg-emerald-100 text-emerald-700 border-emerald-200"
+                          }`}
+                        >
+                          {isPast ? "🔴 Time Passed" : "🟢 Upcoming"}
+                        </span>
+                      </div>
+
+                      <span className="text-[11px] font-bold text-indigo-600 hover:underline">
+                        View Profile ➔
+                      </span>
+                    </div>
+
+                    <div className="flex items-center justify-between pt-2">
+                      <div>
+                        <h4 className="text-xs font-extrabold text-slate-900">
+                          {m.fullName || "Anonymous Client"}
+                        </h4>
+                        <p className="text-[10px] text-slate-500 font-mono">{m.email}</p>
+                      </div>
+
+                      <div className="flex items-center space-x-2" onClick={(e) => e.stopPropagation()}>
+                        <a
+                          href={`tel:${m.countryCode || "+91"}${m.phone}`}
+                          className="w-7 h-7 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 hover:bg-slate-200 flex items-center justify-center text-xs transition-colors"
+                          title="Call Client"
+                        >
+                          <i className="fa-solid fa-phone text-indigo-600"></i>
+                        </a>
+
+                        <a
+                          href={`https://api.whatsapp.com/send?phone=${
+                            m.countryCode ? m.countryCode.replace("+", "") : "91"
+                          }${m.phone}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="w-7 h-7 rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 flex items-center justify-center text-xs transition-colors shadow-2xs"
+                          title="WhatsApp"
+                        >
+                          <i className="fa-brands fa-whatsapp text-sm"></i>
+                        </a>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MANAGE BLOCKED SLOTS & DATES MODAL */}
+      {showBlockSlotsModal && (
+        <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
+          <div
+            className="fixed inset-0"
+            onClick={() => setShowBlockSlotsModal(false)}
+          />
+          <div className="relative w-full max-w-2xl bg-white rounded-3xl shadow-2xl overflow-hidden font-sans border border-slate-200 z-10 animate-in fade-in zoom-in duration-150">
+            {/* Header */}
+            <div className="px-6 py-4 border-b border-slate-200 bg-slate-50 flex items-center justify-between">
+              <div className="flex items-center space-x-3">
+                <div className="w-10 h-10 rounded-2xl bg-amber-100 border border-amber-300 text-amber-900 flex items-center justify-center font-extrabold text-lg shadow-sm">
+                  <i className="fa-solid fa-calendar-xmark"></i>
+                </div>
+                <div>
+                  <h3 className="text-base sm:text-lg font-extrabold text-slate-900">
+                    Manage Slot Availability & Out of Office
+                  </h3>
+                  <p className="text-xs text-slate-500 font-medium">
+                    Mark dates or time slots as booked/unavailable, or unmark to restore.
+                  </p>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setShowBlockSlotsModal(false)}
+                className="w-8 h-8 rounded-full text-slate-400 hover:text-slate-900 hover:bg-slate-200 flex items-center justify-center transition-colors"
+              >
+                <i className="fa-solid fa-xmark text-sm"></i>
+              </button>
+            </div>
+
+            <div className="p-6 space-y-6 max-h-[75vh] overflow-y-auto">
+              {/* Mode Selector Tabs */}
+              <div className="flex items-center bg-slate-100 p-1 rounded-2xl border border-slate-200 text-xs font-bold">
+                <button
+                  type="button"
+                  onClick={() => setBlockMode("range")}
+                  className={`flex-1 py-2 rounded-xl transition-all ${
+                    blockMode === "range"
+                      ? "bg-white text-indigo-700 shadow-sm font-extrabold"
+                      : "text-slate-500 hover:text-slate-900"
+                  }`}
+                >
+                  ✈️ Mark Multi-Day / Out of Office
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setBlockMode("slots")}
+                  className={`flex-1 py-2 rounded-xl transition-all ${
+                    blockMode === "slots"
+                      ? "bg-white text-indigo-700 shadow-sm font-extrabold"
+                      : "text-slate-500 hover:text-slate-900"
+                  }`}
+                >
+                  ⏰ Mark Specific Time Slots
+                </button>
+              </div>
+
+              {/* Mode 1: Date Range Blocking */}
+              {blockMode === "range" && (
+                <form onSubmit={handleMarkRangeAsBooked} className="space-y-4 bg-slate-50/70 p-4 rounded-2xl border border-slate-200">
+                  <h4 className="text-xs font-extrabold text-slate-800 uppercase tracking-wider">
+                    1. Mark Date Range as Booked / Out of Office
+                  </h4>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">
+                        Start Date *
+                      </label>
+                      <input
+                        type="date"
+                        required
+                        value={blockStartDate}
+                        onChange={(e) => setBlockStartDate(e.target.value)}
+                        className="w-full px-3 py-2 text-xs rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-white font-mono font-bold"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">
+                        End Date *
+                      </label>
+                      <input
+                        type="date"
+                        required
+                        value={blockEndDate}
+                        onChange={(e) => setBlockEndDate(e.target.value)}
+                        className="w-full px-3 py-2 text-xs rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-white font-mono font-bold"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-bold text-slate-700 mb-1">
+                      Reason / Label (Optional)
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="e.g. Out of Office, Traveling, Personal Leave"
+                      value={blockReason}
+                      onChange={(e) => setBlockReason(e.target.value)}
+                      className="w-full px-3 py-2 text-xs rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-white"
+                    />
+                  </div>
+
+                  <button
+                    type="submit"
+                    disabled={isSubmittingBlock}
+                    className="w-full py-2.5 bg-amber-500 hover:bg-amber-600 active:scale-98 text-slate-950 font-extrabold text-xs rounded-xl transition-all shadow-md flex items-center justify-center space-x-2"
+                  >
+                    <i className="fa-solid fa-lock text-xs"></i>
+                    <span>{isSubmittingBlock ? "Processing..." : "Mark Dates as Booked"}</span>
+                  </button>
+                </form>
+              )}
+
+              {/* Mode 2: Slot Blocking */}
+              {blockMode === "slots" && (
+                <form onSubmit={handleMarkSlotsAsBooked} className="space-y-4 bg-slate-50/70 p-4 rounded-2xl border border-slate-200">
+                  <h4 className="text-xs font-extrabold text-slate-800 uppercase tracking-wider">
+                    2. Mark Specific Time Slots on a Date
+                  </h4>
+
+                  <div>
+                    <label className="block text-xs font-bold text-slate-700 mb-1">
+                      Select Date *
+                    </label>
+                    <input
+                      type="date"
+                      required
+                      value={blockSlotDate}
+                      onChange={(e) => setBlockSlotDate(e.target.value)}
+                      className="w-full px-3 py-2 text-xs rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-white font-mono font-bold"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-bold text-slate-700 mb-1">
+                      Select Time Slots to Block *
+                    </label>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                      {DEFAULT_DAILY_TIME_SLOTS.map((slot) => {
+                        const isChecked = selectedBlockTimeSlots.includes(slot);
+                        return (
+                          <button
+                            type="button"
+                            key={slot}
+                            onClick={() => {
+                              if (isChecked) {
+                                setSelectedBlockTimeSlots(selectedBlockTimeSlots.filter((s) => s !== slot));
+                              } else {
+                                setSelectedBlockTimeSlots([...selectedBlockTimeSlots, slot]);
+                              }
+                            }}
+                            className={`p-2 rounded-xl text-xs font-bold transition-all border text-center ${
+                              isChecked
+                                ? "bg-amber-500 text-slate-950 border-amber-600 font-extrabold shadow-sm"
+                                : "bg-white text-slate-700 border-slate-300 hover:bg-slate-100"
+                            }`}
+                          >
+                            🕒 {slot}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-bold text-slate-700 mb-1">
+                      Reason / Label (Optional)
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="e.g. Busy with client call"
+                      value={blockReason}
+                      onChange={(e) => setBlockReason(e.target.value)}
+                      className="w-full px-3 py-2 text-xs rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-white"
+                    />
+                  </div>
+
+                  <button
+                    type="submit"
+                    disabled={isSubmittingBlock || selectedBlockTimeSlots.length === 0}
+                    className="w-full py-2.5 bg-amber-500 hover:bg-amber-600 active:scale-98 text-slate-950 font-extrabold text-xs rounded-xl transition-all shadow-md flex items-center justify-center space-x-2 disabled:opacity-50 disabled:pointer-events-none"
+                  >
+                    <i className="fa-solid fa-lock text-xs"></i>
+                    <span>{isSubmittingBlock ? "Processing..." : `Mark ${selectedBlockTimeSlots.length} Selected Slot(s) as Booked`}</span>
+                  </button>
+                </form>
+              )}
+
+              {/* Unmark / View Currently Blocked Section */}
+              <div className="space-y-3 border-t border-slate-200 pt-4">
+                <div className="flex items-center justify-between">
+                  <h4 className="text-xs font-extrabold text-slate-900 uppercase tracking-wider flex items-center space-x-2">
+                    <i className="fa-solid fa-list-check text-indigo-600"></i>
+                    <span>Currently Blocked Dates & Slots ({blockedSlotsList.length})</span>
+                  </h4>
+                  <button
+                    type="button"
+                    onClick={fetchBlockedSlotsList}
+                    className="text-[11px] text-indigo-600 hover:underline font-bold"
+                  >
+                    Refresh List
+                  </button>
+                </div>
+
+                {blockedSlotsList.length === 0 ? (
+                  <div className="p-4 text-center bg-slate-50 rounded-2xl border border-slate-200 text-xs text-slate-500 font-medium">
+                    No dates or slots are currently marked as booked/blocked.
+                  </div>
+                ) : (
+                  <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+                    {blockedSlotsList.map((item) => (
+                      <div
+                        key={item.dateStr}
+                        className="p-3 rounded-2xl bg-white border border-slate-200 shadow-2xs flex items-center justify-between gap-3"
+                      >
+                        <div className="space-y-1">
+                          <div className="flex items-center space-x-2">
+                            <span className="font-mono text-xs font-extrabold text-slate-900">
+                              📅 {item.dateStr}
+                            </span>
+
+                            {item.isFullDateBlocked ? (
+                              <span className="bg-red-100 text-red-800 border border-red-300 text-[10px] font-extrabold px-2 py-0.5 rounded-full uppercase">
+                                Full Date Blocked
+                              </span>
+                            ) : (
+                              <span className="bg-amber-100 text-amber-900 border border-amber-300 text-[10px] font-bold px-2 py-0.5 rounded-full">
+                                {item.blockedSlots.length} Slots Blocked
+                              </span>
+                            )}
+                          </div>
+
+                          <p className="text-[11px] text-slate-500 font-medium">
+                            Reason: <span className="text-slate-800 font-semibold">{item.reason || "Marked as booked"}</span>
+                          </p>
+
+                          {!item.isFullDateBlocked && item.blockedSlots.length > 0 && (
+                            <div className="flex flex-wrap gap-1 pt-1">
+                              {item.blockedSlots.map((sKey) => {
+                                const humanTime = sKey.replace(/_/g, " ");
+                                return (
+                                  <span
+                                    key={sKey}
+                                    className="bg-slate-100 text-slate-700 text-[10px] font-mono font-bold px-2 py-0.5 rounded-md flex items-center space-x-1 border border-slate-200"
+                                  >
+                                    <span>{humanTime}</span>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleUnmark(item.dateStr, humanTime)}
+                                      className="text-red-500 hover:text-red-700 ml-1 font-extrabold"
+                                      title="Unmark this slot"
+                                    >
+                                      &times;
+                                    </button>
+                                  </span>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+
+                        <button
+                          type="button"
+                          onClick={() => handleUnmark(item.dateStr)}
+                          className="px-3 py-1.5 bg-emerald-50 hover:bg-emerald-100 border border-emerald-300 text-emerald-800 font-extrabold text-xs rounded-xl transition-all whitespace-nowrap shadow-2xs"
+                        >
+                          🔓 Unmark Date
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* FULLY RESPONSIVE SLIDE-OVER DRAWER */}
+      {isDrawerOpen && selectedLead && (
+        <div className="fixed inset-0 z-50 overflow-hidden bg-slate-900/50 backdrop-blur-sm flex justify-end">
+          <div
+            className="absolute inset-0 hidden sm:block"
+            onClick={handleCloseDrawer}
+          />
+
+          <div className="relative w-full sm:max-w-lg bg-white h-full shadow-2xl flex flex-col font-sans border-l border-slate-200 z-10 overflow-hidden">
+            <div className="px-4 py-3.5 sm:px-5 sm:py-4 border-b border-slate-200 bg-slate-50 flex items-center justify-between sticky top-0 z-20">
+              <div className="flex items-center space-x-3 truncate">
+                <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-xl bg-indigo-600 text-white font-bold text-sm sm:text-base flex items-center justify-center shadow-sm flex-shrink-0">
+                  {selectedLead.fullName?.charAt(0).toUpperCase() || "L"}
+                </div>
+                <div className="truncate">
+                  <h3 className="text-xs sm:text-sm font-bold text-slate-900 truncate leading-tight">
+                    {selectedLead.fullName || "Anonymous Lead"}
+                  </h3>
+                  <p className="text-[11px] text-slate-500 truncate">{selectedLead.email}</p>
+                </div>
+              </div>
+
+              <div className="flex items-center space-x-2 flex-shrink-0">
+                <button
+                  type="button"
+                  onClick={() => handleDeleteLead(selectedLead)}
+                  disabled={isDeletingLead}
+                  className="px-2.5 py-1 text-xs font-bold text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded-lg transition-all flex items-center space-x-1 cursor-pointer disabled:opacity-50"
+                  title="Delete this lead from database"
+                >
+                  <i className="fa-solid fa-trash-can"></i>
+                  <span>Delete Lead</span>
+                </button>
+                <button
+                  onClick={handleCloseDrawer}
+                  className="w-8 h-8 rounded-full text-slate-500 hover:text-slate-900 hover:bg-slate-200/80 flex items-center justify-center text-sm transition-colors"
+                >
+                  <i className="fa-solid fa-xmark"></i>
+                </button>
+              </div>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-3.5 sm:p-5 space-y-4 sm:space-y-5">
+              {(!selectedLead.phone || String(selectedLead.phone).trim().replace(/\D/g, "").length < 5) && (
+                <div className="bg-amber-50 border border-amber-200 rounded-2xl p-3.5 space-y-1 text-amber-900 shadow-2xs">
+                  <div className="flex items-center space-x-2">
+                    <i className="fa-solid fa-triangle-exclamation text-amber-600 text-sm"></i>
+                    <h4 className="text-xs font-extrabold">Incomplete Contact Details</h4>
+                  </div>
+                  <p className="text-[11px] text-amber-800">
+                    This lead has no valid phone number. Automated WhatsApp messaging and reminders are automatically disabled for this record.
+                  </p>
+                </div>
+              )}
+
+              {/* Pipeline Stage Selector & Deal Value (₹) */}
+              <div className="bg-slate-50 border border-slate-200 rounded-2xl p-3 sm:p-4 space-y-3">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-bold text-slate-700 uppercase tracking-wider text-[10px]">
+                    Pipeline Stage
+                  </span>
+                  <select
+                    value={getLeadEffectiveStage(selectedLead)}
+                    onChange={(e) => handleUpdateStage(selectedLead, e.target.value)}
+                    className="bg-white border border-slate-300 rounded-xl px-2.5 py-1 font-bold text-xs text-indigo-600 focus:outline-none cursor-pointer"
+                  >
+                    {activePipelineStages.map((st) => (
+                      <option key={st.id} value={st.id}>
+                        {st.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="flex items-center justify-between text-xs pt-1 border-t border-slate-200">
+                  <span className="font-bold text-slate-700">Deal Value (₹):</span>
+                  <div className="flex items-center space-x-2">
+                    <input
+                      type="number"
+                      placeholder="e.g. 50000"
+                      value={dealValueInput}
+                      onChange={(e) => setDealValueInput(e.target.value)}
+                      onWheel={(e) => e.currentTarget.blur()}
+                      className="w-28 bg-white border border-slate-300 rounded-xl px-2.5 py-1 text-xs font-mono font-bold text-slate-900 focus:outline-none focus:border-indigo-600 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+                    />
+                    {dealValueInput !== (selectedLead.dealValue ? selectedLead.dealValue.toString() : "") && (
+                      <button
+                        type="button"
+                        disabled={isSavingStaffData}
+                        onClick={() => handleSaveDealValue(dealValueInput)}
+                        className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold px-2.5 py-1 rounded-xl transition-colors disabled:opacity-50"
+                      >
+                        Save ₹
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2 pt-1">
+                  <a
+                    href={`tel:${selectedLead.countryCode || "+91"}${selectedLead.phone}`}
+                    className="flex items-center justify-center space-x-1.5 bg-indigo-600 hover:bg-indigo-700 text-white py-2 rounded-xl text-xs font-bold transition-colors shadow-sm"
+                  >
+                    <i className="fa-solid fa-phone text-xs"></i>
+                    <span>Call Client</span>
+                  </a>
+
+                  <a
+                    href={`https://api.whatsapp.com/send?phone=${
+                      selectedLead.countryCode ? selectedLead.countryCode.replace("+", "") : "91"
+                    }${selectedLead.phone}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="flex items-center justify-center space-x-1.5 bg-emerald-600 hover:bg-emerald-700 text-white py-2 rounded-xl text-xs font-bold transition-colors shadow-sm"
+                  >
+                    <i className="fa-brands fa-whatsapp text-sm"></i>
+                    <span>WhatsApp</span>
+                  </a>
+                </div>
+              </div>
+
+              {/* GOOGLE MEET VIDEO CALL SECTION INSIDE DRAWER */}
+              <div className="bg-gradient-to-r from-blue-900 to-indigo-900 border border-blue-700 rounded-2xl p-4 space-y-2.5 shadow-md text-white font-sans">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center space-x-2">
+                    <div className="w-8 h-8 rounded-xl bg-blue-800 border border-blue-600 flex items-center justify-center text-blue-200 font-extrabold text-sm">
+                      🎥
+                    </div>
+                    <div>
+                      <h4 className="text-xs font-black text-white">Google Meet Video Call</h4>
+                      <p className="text-[10px] text-blue-200">Consultation link: https://meet.google.com/umb-fmid-jjy</p>
+                    </div>
+                  </div>
+
+                  <span className="bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-[9px] font-extrabold px-2 py-0.5 rounded-full uppercase tracking-wider">
+                    Active
+                  </span>
+                </div>
+
+                <div className="bg-slate-900/90 border border-blue-800 rounded-xl p-2.5 flex items-center justify-between gap-2 font-mono text-xs">
+                  <span className="truncate text-blue-200 text-[11px] font-bold">
+                    https://meet.google.com/umb-fmid-jjy
+                  </span>
+
+                  <button
+                    type="button"
+                    onClick={() => handleCopyLink("https://meet.google.com/umb-fmid-jjy", "meet")}
+                    className="bg-blue-800 hover:bg-blue-700 text-blue-100 font-extrabold text-[10px] px-2.5 py-1 rounded-lg border border-blue-600 transition-colors flex-shrink-0 cursor-pointer"
+                  >
+                    {copiedLink === "meet" ? "Copied! ✓" : "Copy 📋"}
+                  </button>
+                </div>
+
+                <a
+                  href="https://meet.google.com/umb-fmid-jjy"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-black py-2.5 px-4 rounded-xl text-xs flex items-center justify-center space-x-2 shadow-lg transition-all cursor-pointer"
+                >
+                  <i className="fa-solid fa-video text-xs"></i>
+                  <span>Join Google Meet Call Now 🚀</span>
+                </a>
+              </div>
+
+              {/* DETAILED SURVEY RESPONSES */}
+              {selectedLead.survey && Object.keys(selectedLead.survey).length > 0 && (
+                <div className="bg-white border border-slate-200 rounded-2xl p-3.5 sm:p-4 space-y-2 shadow-sm">
+                  <h4 className="text-xs font-bold text-slate-800 flex items-center space-x-1.5">
+                    <i className="fa-solid fa-list-check text-blue-600"></i>
+                    <span>Survey Responses Profile</span>
+                  </h4>
+
+                  <div className="grid grid-cols-1 gap-2 pt-1">
+                    {Object.keys(selectedLead.survey).map((qKey) => (
+                      <div
+                        key={qKey}
+                        className="bg-slate-50 border border-slate-200/80 rounded-xl p-2.5 text-xs flex justify-between items-center"
+                      >
+                        <span className="text-slate-500 capitalize font-medium">{qKey}:</span>
+                        <span className="font-bold text-slate-900 bg-white px-2 py-0.5 rounded border border-slate-200 truncate max-w-[180px]">
+                          {selectedLead.survey![qKey]}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* TECHNICAL & LINKS SECTION */}
+              <div className="bg-slate-50 border border-slate-200 rounded-2xl p-3.5 sm:p-4 space-y-2 text-xs">
+                <div className="flex justify-between items-center text-slate-500 text-[11px]">
+                  <span>Campaign: <strong className="text-slate-800">{selectedLead.campaign || "firstoptionagency"}</strong></span>
+                  <span>Created: <strong className="text-slate-800">{selectedLead.createdDate}</strong></span>
+                </div>
+
+                {selectedLead.links?.surveyUrl && (
+                  <div className="pt-2 border-t border-slate-200/80 flex items-center justify-between text-[11px]">
+                    <span className="text-slate-600 font-semibold truncate max-w-[180px] sm:max-w-[240px]">
+                      Survey Link
+                    </span>
+                    <button
+                      onClick={() => handleCopyLink(selectedLead.links!.surveyUrl!, "survey")}
+                      className="text-indigo-600 hover:text-indigo-800 font-bold bg-white border border-slate-200 px-2 py-0.5 rounded transition-colors"
+                    >
+                      {copiedLink === "survey" ? "Copied! ✓" : "Copy Link"}
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MANAGE PIPELINE STAGES & RECYCLE BIN MODAL */}
+      {isManagePipelineModalOpen && (
+        <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="fixed inset-0" onClick={() => setIsManagePipelineModalOpen(false)} />
+          <div className="relative w-full max-w-2xl bg-white rounded-3xl shadow-2xl p-6 sm:p-8 space-y-6 border border-slate-200 z-10 font-sans animate-in fade-in zoom-in duration-150">
+            {/* Header */}
+            <div className="flex items-center justify-between border-b border-slate-100 pb-4">
+              <div>
+                <h3 className="text-lg font-extrabold text-slate-900 flex items-center space-x-2">
+                  <span>Manage Pipeline Stages ⚙️</span>
+                </h3>
+                <p className="text-xs text-slate-500 font-medium mt-0.5">
+                  <strong className="text-indigo-600 font-extrabold">Leads</strong> and <strong className="text-emerald-600 font-extrabold">Won</strong> are compulsory core stages that cannot be deleted or renamed. Create new stages, rename intermediate headers, or restore deleted stages from the Recycle Bin.
+                </p>
+              </div>
+
+              <button
+                onClick={() => setIsManagePipelineModalOpen(false)}
+                className="w-8 h-8 rounded-full bg-slate-100 text-slate-500 hover:text-slate-900 font-bold flex items-center justify-center transition-colors cursor-pointer"
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Modal Tabs: Active Stages vs Recycle Bin */}
+            <div className="flex items-center justify-between border-b border-slate-200 pb-2">
+              <div className="flex items-center space-x-2">
+                <button
+                  onClick={() => setManagePipelineTab("active")}
+                  className={`px-4 py-1.5 rounded-xl text-xs font-extrabold transition-all cursor-pointer ${
+                    managePipelineTab === "active"
+                      ? "bg-indigo-600 text-white shadow-sm"
+                      : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                  }`}
+                >
+                  Active Pipeline Stages ({activePipelineStages.length})
+                </button>
+
+                <button
+                  onClick={() => setManagePipelineTab("bin")}
+                  className={`px-4 py-1.5 rounded-xl text-xs font-extrabold transition-all flex items-center space-x-1.5 cursor-pointer ${
+                    managePipelineTab === "bin"
+                      ? "bg-rose-600 text-white shadow-sm"
+                      : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                  }`}
+                >
+                  <i className="fa-solid fa-trash-can text-xs"></i>
+                  <span>Recycle Bin ({deletedPipelineStages.length})</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Active Stages Content */}
+            {managePipelineTab === "active" ? (
+              <div className="space-y-5">
+                {/* Add New Custom Stage Form */}
+                <form onSubmit={handleAddCustomStage} className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-3">
+                  <span className="text-xs font-extrabold text-slate-900 uppercase tracking-wider block">
+                    Create New Pipeline Stage
+                  </span>
+                  <div className="flex flex-col sm:flex-row items-center gap-2">
+                    <input
+                      type="text"
+                      placeholder="Stage Name (e.g. Proposal Under Review)"
+                      value={newStageName}
+                      onChange={(e) => setNewStageName(e.target.value)}
+                      className="bg-white border border-slate-300 rounded-xl px-3 py-2 text-xs font-bold text-slate-900 focus:outline-none focus:border-indigo-600 flex-1 w-full"
+                      required
+                    />
+
+                    <div className="flex items-center space-x-2">
+                      <span className="text-xs font-bold text-slate-600">Color:</span>
+                      <input
+                        type="color"
+                        value={newStageColor}
+                        onChange={(e) => setNewStageColor(e.target.value)}
+                        className="w-8 h-8 rounded-xl border border-slate-300 cursor-pointer p-0.5 bg-white"
+                      />
+                    </div>
+
+                    <button
+                      type="submit"
+                      className="bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-extrabold px-4 py-2 rounded-xl shadow-md transition-all flex-shrink-0 flex items-center space-x-1 cursor-pointer"
+                    >
+                      <i className="fa-solid fa-plus text-xs"></i>
+                      <span>Add Stage</span>
+                    </button>
+                  </div>
+                </form>
+
+                {/* Active Stages List */}
+                <div className="space-y-2.5 max-h-72 overflow-y-auto pr-1">
+                  {activePipelineStages.map((st) => (
+                    <div
+                      key={st.id}
+                      className={`border rounded-2xl p-3.5 flex items-center justify-between gap-3 shadow-2xs ${
+                        st.isCompulsory
+                          ? "bg-slate-50 border-indigo-200"
+                          : "bg-white border-slate-200"
+                      }`}
+                    >
+                      <div className="flex items-center space-x-3 flex-1 min-w-0">
+                        <span
+                          className="w-4 h-4 rounded-full flex-shrink-0"
+                          style={{ backgroundColor: st.color || "#6366f1" }}
+                        ></span>
+
+                        {editingStageId === st.id ? (
+                          <div className="flex items-center space-x-2 flex-1">
+                            <input
+                              type="text"
+                              value={editingStageName}
+                              onChange={(e) => setEditingStageName(e.target.value)}
+                              className="bg-slate-50 border border-slate-300 rounded-xl px-2.5 py-1 text-xs font-bold text-slate-900 focus:outline-none w-full"
+                            />
+                            <button
+                              onClick={() => handleSaveRenameStage(st.id)}
+                              className="bg-emerald-600 hover:bg-emerald-700 text-white text-[10px] font-extrabold px-2.5 py-1 rounded-xl shadow-2xs cursor-pointer"
+                            >
+                              Save
+                            </button>
+                            <button
+                              onClick={() => setEditingStageId(null)}
+                              className="text-slate-500 hover:text-slate-700 text-[10px] font-bold px-2 py-1 cursor-pointer"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="flex items-center space-x-2 truncate">
+                            <span className="text-xs font-extrabold text-slate-900 truncate">
+                              {st.name}
+                            </span>
+                            <span className="text-[10px] font-mono text-slate-400 font-bold">
+                              ({st.id})
+                            </span>
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="flex items-center space-x-2 flex-shrink-0">
+                        {st.isCompulsory || st.id === "raw" || st.id === "won" ? (
+                          <span className="text-[10px] font-mono font-extrabold text-indigo-700 bg-indigo-50 border border-indigo-200 px-2.5 py-1 rounded-xl">
+                            🔒 Compulsory Core Stage
+                          </span>
+                        ) : (
+                          <>
+                            {editingStageId !== st.id && (
+                              <button
+                                onClick={() => {
+                                  setEditingStageId(st.id);
+                                  setEditingStageName(st.name);
+                                }}
+                                className="bg-slate-100 hover:bg-slate-200 text-slate-700 text-[11px] font-extrabold px-2.5 py-1 rounded-xl transition-colors cursor-pointer"
+                              >
+                                Edit ✏️
+                              </button>
+                            )}
+
+                            <button
+                              onClick={() => handleSoftDeleteStage(st.id)}
+                              className="bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 text-[11px] font-extrabold px-2.5 py-1 rounded-xl transition-colors cursor-pointer"
+                              title="Soft delete (move to Recycle Bin)"
+                            >
+                              Move to Bin 🗑️
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              /* Recycle Bin Tab */
+              <div className="space-y-4 font-sans">
+                <div className="bg-amber-50 border border-amber-200 rounded-2xl p-3.5 text-xs text-amber-900 font-semibold">
+                  ℹ️ Stages deleted from the pipeline are safely kept in the Recycle Bin with status <code className="font-bold">isDeleted: true</code>. You can restore them anytime to bring them back to your live Kanban pipeline board!
+                </div>
+
+                {deletedPipelineStages.length === 0 ? (
+                  <div className="p-8 border border-dashed border-slate-200 rounded-2xl text-center space-y-1">
+                    <span className="text-xl block">🗑️</span>
+                    <span className="text-xs font-bold text-slate-500">Recycle Bin is Empty</span>
+                    <p className="text-[11px] text-slate-400">No soft-deleted pipeline stages found.</p>
+                  </div>
+                ) : (
+                  <div className="space-y-2.5 max-h-72 overflow-y-auto pr-1">
+                    {deletedPipelineStages.map((st) => (
+                      <div
+                        key={st.id}
+                        className="bg-rose-50/40 border border-rose-200 rounded-2xl p-3.5 flex items-center justify-between gap-3"
+                      >
+                        <div className="flex items-center space-x-3 truncate">
+                          <span
+                            className="w-4 h-4 rounded-full flex-shrink-0"
+                            style={{ backgroundColor: st.color || "#f43f5e" }}
+                          ></span>
+                          <div className="truncate">
+                            <span className="text-xs font-extrabold text-slate-900 block truncate">
+                              {st.name}
+                            </span>
+                            <span className="text-[10px] font-mono text-rose-700 font-bold">
+                              Status: isDeleted = true
+                            </span>
+                          </div>
+                        </div>
+
+                        <button
+                          onClick={() => handleRestoreSoftDeletedStage(st.id)}
+                          className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-extrabold px-3.5 py-1.5 rounded-xl shadow-2xs transition-colors flex items-center space-x-1.5 flex-shrink-0 cursor-pointer"
+                        >
+                          <i className="fa-solid fa-rotate-left text-xs"></i>
+                          <span>Restore Stage 🔄</span>
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="pt-2 border-t border-slate-100 flex items-center justify-end">
+              <button
+                onClick={() => setIsManagePipelineModalOpen(false)}
+                className="bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-extrabold px-5 py-2 rounded-xl transition-colors cursor-pointer"
+              >
+                Close Manager
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* STAGE AUTOMATION CONFIGURATION RIGHT DRAWER */}
+      {isStageAutomationModalOpen && activeAutomationStage && (
+        <div className="fixed inset-0 z-50 overflow-hidden bg-slate-900/60 backdrop-blur-xs flex justify-end font-sans">
+          {/* Backdrop Click Handler */}
+          <div
+            className="fixed inset-0 transition-opacity"
+            onClick={() => setIsStageAutomationModalOpen(false)}
+          />
+
+          {/* Right Sliding Drawer Panel */}
+          <div className="relative w-full max-w-2xl bg-white shadow-2xl h-full flex flex-col z-10 border-l border-slate-200 animate-in slide-in-from-right duration-200">
+            {/* Sticky Drawer Header */}
+            <div className="px-6 py-4 border-b border-slate-200 bg-white flex items-center justify-between sticky top-0 z-20 shadow-xs">
+              <div className="flex items-center space-x-3">
+                <span
+                  className="w-4 h-4 rounded-full flex-shrink-0"
+                  style={{ backgroundColor: activeAutomationStage.color || "#6366f1" }}
+                />
+                <div>
+                  <h3 className="text-base sm:text-lg font-extrabold text-slate-900 flex items-center space-x-2">
+                    <span>Stage Automations: {activeAutomationStage.name} ⚡</span>
+                  </h3>
+                  <p className="text-xs text-slate-500 font-medium mt-0.5">
+                    Configure automated WhatsApp messages sent relative to meeting date or lead creation date.
+                  </p>
+                </div>
+              </div>
+
+              <button
+                onClick={() => setIsStageAutomationModalOpen(false)}
+                className="w-8 h-8 rounded-full bg-slate-100 hover:bg-slate-200 text-slate-500 hover:text-slate-900 font-bold flex items-center justify-center transition-colors cursor-pointer flex-shrink-0"
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Scrollable Body */}
+            <div className="p-6 overflow-y-auto space-y-6 flex-1 scrollbar-thin">
+              {/* Create New Stage Automation Form */}
+              <form onSubmit={handleSaveStageRule} className="bg-slate-50 border border-slate-200 rounded-2xl p-5 space-y-4">
+                <div className="flex items-center justify-between border-b border-slate-200/80 pb-2">
+                  <h4 className="text-xs font-extrabold text-indigo-700 uppercase tracking-wider flex items-center space-x-1.5">
+                    <i className="fa-solid fa-bolt text-xs"></i>
+                    <span>Add Automation Rule for "{activeAutomationStage.name}"</span>
+                  </h4>
+
+                  <button
+                    type="button"
+                    onClick={() => setIsAutomationGuideOpen(!isAutomationGuideOpen)}
+                    className="bg-indigo-100 hover:bg-indigo-200 text-indigo-800 border border-indigo-300 text-xs font-extrabold px-2.5 py-1 rounded-xl transition-all flex items-center space-x-1.5 cursor-pointer shadow-2xs"
+                    title="Click to view detailed guide & 3 real-world examples"
+                  >
+                    <span className="w-4 h-4 rounded-full bg-indigo-600 text-white flex items-center justify-center text-[10px] font-black">i</span>
+                    <span>{isAutomationGuideOpen ? "Hide Guide ✕" : "How Automations Work (3 Examples) ℹ️"}</span>
+                  </button>
+                </div>
+
+                {isAutomationGuideOpen && (
+                  <div className="bg-indigo-900 text-white rounded-2xl p-5 space-y-4 shadow-xl border border-indigo-700 animate-in fade-in slide-in-from-top-2 duration-200">
+                    <div className="flex items-center justify-between border-b border-indigo-700/80 pb-2.5">
+                      <h5 className="text-xs font-extrabold uppercase tracking-wider text-indigo-200 flex items-center space-x-2">
+                        <span className="w-5 h-5 rounded-full bg-indigo-500 text-white flex items-center justify-center text-[11px]">i</span>
+                        <span>How WhatsApp Stage Automations Work & 3 Examples</span>
+                      </h5>
+                      <span className="text-[10px] font-mono bg-indigo-800 text-indigo-300 px-2 py-0.5 rounded-md border border-indigo-600 font-bold">
+                        24/7 Realtime Cron Engine
+                      </span>
+                    </div>
+
+                    <p className="text-xs text-indigo-100 leading-relaxed font-medium">
+                      Our background cron daemon runs every minute, inspecting leads in your Firebase Realtime Database. When a lead enters a stage, the system calculates the exact trigger time based on your configuration:
+                    </p>
+
+                    {/* 3 Interactive Cards */}
+                    <div className="grid grid-cols-1 gap-3 font-sans text-xs">
+                      {/* Example 1 */}
+                      <div className="bg-indigo-800/80 border border-indigo-600 rounded-xl p-3.5 space-y-2">
+                        <div className="flex items-center justify-between">
+                          <span className="font-extrabold text-amber-300 text-[11px] uppercase tracking-wide">
+                            Example 1: Meeting Reminder
+                          </span>
+                          <span className="text-[9px] bg-amber-400/20 text-amber-200 px-1.5 py-0.5 rounded font-mono font-bold">
+                            ⏳ Before Event
+                          </span>
+                        </div>
+                        <div className="text-[11px] text-indigo-100 space-y-1">
+                          <p><strong>Base:</strong> Meeting Booked Date</p>
+                          <p><strong>Offset:</strong> 15 Minutes Before</p>
+                        </div>
+                        <div className="bg-indigo-950/70 p-2 rounded-lg text-[10px] font-mono text-emerald-300 border border-indigo-700/50">
+                          💬 "Hi {"{{name}}"}, your session starts in 15 mins at {"{{time}}"}!"
+                        </div>
+                      </div>
+
+                      {/* Example 2 */}
+                      <div className="bg-indigo-800/80 border border-indigo-600 rounded-xl p-3.5 space-y-2">
+                        <div className="flex items-center justify-between">
+                          <span className="font-extrabold text-cyan-300 text-[11px] uppercase tracking-wide">
+                            Example 2: Post-Survey Follow-up
+                          </span>
+                          <span className="text-[9px] bg-cyan-400/20 text-cyan-200 px-1.5 py-0.5 rounded font-mono font-bold">
+                            ⏩ After Entry
+                          </span>
+                        </div>
+                        <div className="text-[11px] text-indigo-100 space-y-1">
+                          <p><strong>Base:</strong> Lead Creation / Entry</p>
+                          <p><strong>Offset:</strong> 1 Day After</p>
+                        </div>
+                        <div className="bg-indigo-950/70 p-2 rounded-lg text-[10px] font-mono text-cyan-300 border border-indigo-700/50">
+                          💬 "Hello {"{{name}}"}, you filled out our survey yesterday! Book a call slot today."
+                        </div>
+                      </div>
+
+
+                    </div>
+
+                    <div className="bg-rose-950/60 border border-rose-800/80 rounded-xl p-2.5 text-[11px] text-rose-200 flex items-start space-x-2">
+                      <span className="text-sm">⚠️</span>
+                      <div>
+                        <strong className="font-bold text-rose-300 block">Missing Meeting Date Warning:</strong>
+                        If a rule uses <code className="font-bold text-white">Meeting Booked Date</code> as reference, but a lead in that stage doesn't have a booked meeting date yet, a red warning badge <code className="font-bold text-rose-300">⚠️ Meeting Date missing</code> is displayed on their card and sending is safely skipped!
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  {/* Rule Title */}
+                  <div className="space-y-1 sm:col-span-2">
+                    <label className="text-[11px] font-extrabold text-slate-700">Automation Rule Title:</label>
+                    <input
+                      type="text"
+                      placeholder="e.g. 10 Min Before Meeting Reminder or 1 Day After Entry"
+                      value={ruleTitle}
+                      onChange={(e) => setRuleTitle(e.target.value)}
+                      className="w-full bg-white border border-slate-300 rounded-xl px-3 py-2 text-xs font-bold text-slate-900 focus:outline-none focus:border-indigo-600"
+                      required
+                    />
+                  </div>
+
+                  {/* Select WhatsApp Instance */}
+                  <div className="space-y-1 sm:col-span-2">
+                    <label className="text-[11px] font-extrabold text-slate-700">Select WhatsApp Sender Instance for Rule:</label>
+                    <select
+                      value={ruleInstanceName}
+                      onChange={(e) => setRuleInstanceName(e.target.value)}
+                      className="w-full bg-white border border-slate-300 rounded-xl px-3 py-2 text-xs font-bold text-indigo-700 focus:outline-none focus:border-indigo-600 cursor-pointer"
+                    >
+                      <option value="">-- Use Default Active Instance --</option>
+                      {whatsappInstancesList.map((inst: any) => (
+                        <option key={inst.instanceId} value={inst.instanceName}>
+                          🚀 {inst.instanceName} ({inst.status})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {/* Reference Target Base */}
+                  <div className="space-y-1">
+                    <div className="flex items-center justify-between">
+                      <label className="text-[11px] font-extrabold text-slate-700">Reference Target Base:</label>
+                      <button
+                        type="button"
+                        onClick={() => setShowReferenceBaseInfo(!showReferenceBaseInfo)}
+                        className="w-4 h-4 rounded-full bg-indigo-100 hover:bg-indigo-200 text-indigo-700 font-black text-[10px] flex items-center justify-center cursor-pointer transition-colors"
+                        title="Click for explanation of Reference Target Base"
+                      >
+                        ℹ️
+                      </button>
+                    </div>
+                    <select
+                      value={ruleTriggerBase}
+                      onChange={(e) => setRuleTriggerBase(e.target.value as any)}
+                      className="w-full bg-white border border-slate-300 rounded-xl px-3 py-2 text-xs font-bold text-slate-900 focus:outline-none focus:border-indigo-600 cursor-pointer"
+                    >
+                      <option value="meeting">📅 Meeting Booked Date & Time</option>
+                      <option value="created">📝 Lead Creation Date & Time</option>
+                    </select>
+
+                    {showReferenceBaseInfo && (
+                      <div className="bg-slate-900 text-white rounded-xl p-3 text-[11px] space-y-2 border border-slate-700 shadow-xl animate-in fade-in zoom-in duration-150">
+                        <div className="flex items-center justify-between border-b border-slate-700 pb-1">
+                          <span className="font-extrabold text-indigo-300">ℹ️ Reference Base Explanation</span>
+                          <button type="button" onClick={() => setShowReferenceBaseInfo(false)} className="text-slate-400 hover:text-white text-xs">✕</button>
+                        </div>
+                        <div className="space-y-1 font-sans">
+                          <p className="text-emerald-300 font-bold">
+                            📅 Meeting Booked Date & Time:
+                            <span className="text-slate-200 font-normal block">Uses lead's scheduled meeting date & time. Skips leads missing a booked call.</span>
+                          </p>
+                          <p className="text-indigo-300 font-bold">
+                            📝 Lead Creation Date & Time:
+                            <span className="text-slate-200 font-normal block">Uses the timestamp when the lead filled out the popup form or entered stage.</span>
+                          </p>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Timing Offset Direction */}
+                  <div className="space-y-1">
+                    <div className="flex items-center justify-between">
+                      <label className="text-[11px] font-extrabold text-slate-700">Timing Direction:</label>
+                      <button
+                        type="button"
+                        onClick={() => setShowTimingDirectionInfo(!showTimingDirectionInfo)}
+                        className="w-4 h-4 rounded-full bg-indigo-100 hover:bg-indigo-200 text-indigo-700 font-black text-[10px] flex items-center justify-center cursor-pointer transition-colors"
+                        title="Click for explanation of Timing Direction options"
+                      >
+                        ℹ️
+                      </button>
+                    </div>
+                    <select
+                      value={ruleTriggerBase === "created" ? "after" : ruleOffsetType}
+                      onChange={(e) => setRuleOffsetType(e.target.value as any)}
+                      disabled={ruleTriggerBase === "created"}
+                      className="w-full bg-white border border-slate-300 rounded-xl px-3 py-2 text-xs font-bold text-slate-900 focus:outline-none focus:border-indigo-600 cursor-pointer disabled:bg-slate-100 disabled:text-slate-500"
+                    >
+                      <option value="after">⏩ After Event Entry</option>
+                      {ruleTriggerBase === "meeting" && <option value="before">⏳ Before Event Target</option>}
+                    </select>
+
+                    {showTimingDirectionInfo && (
+                      <div className="bg-slate-900 text-white rounded-xl p-3 text-[11px] space-y-2 border border-slate-700 shadow-xl animate-in fade-in zoom-in duration-150">
+                        <div className="flex items-center justify-between border-b border-slate-700 pb-1">
+                          <span className="font-extrabold text-indigo-300">ℹ️ Understanding Timing Direction</span>
+                          <button type="button" onClick={() => setShowTimingDirectionInfo(false)} className="text-slate-400 hover:text-white text-xs">✕</button>
+                        </div>
+                        <div className="space-y-1.5 font-sans">
+                          <p className="text-amber-300 font-bold">
+                            ⏳ Before Event Target:
+                            <span className="text-slate-200 font-normal block">Triggers X time BEFORE a scheduled meeting (e.g. 15 mins BEFORE Meeting Date). Use for future meeting reminders!</span>
+                          </p>
+                          <p className="text-cyan-300 font-bold">
+                            ⏩ After Event Entry:
+                            <span className="text-slate-200 font-normal block">Triggers ONCE X time AFTER a lead enters (e.g. 1 Day After Creation).</span>
+                          </p>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Offset Value */}
+                  <div className="space-y-1">
+                    <label className="text-[11px] font-extrabold text-slate-700">Offset Amount:</label>
+                    <input
+                      type="number"
+                      min={1}
+                      value={ruleOffsetValue}
+                      onChange={(e) => setRuleOffsetValue(Number(e.target.value))}
+                      className="w-full bg-white border border-slate-300 rounded-xl px-3 py-2 text-xs font-bold text-slate-900 focus:outline-none focus:border-indigo-600"
+                      required
+                    />
+                  </div>
+
+                  {/* Offset Unit */}
+                  <div className="space-y-1">
+                    <label className="text-[11px] font-extrabold text-slate-700">Time Unit:</label>
+                    <select
+                      value={ruleOffsetUnit}
+                      onChange={(e) => setRuleOffsetUnit(e.target.value as any)}
+                      className="w-full bg-white border border-slate-300 rounded-xl px-3 py-2 text-xs font-bold text-slate-900 focus:outline-none focus:border-indigo-600 cursor-pointer"
+                    >
+                      <option value="minutes">Minutes (m)</option>
+                      <option value="hours">Hours (h)</option>
+                      <option value="days">Days (d)</option>
+                    </select>
+                  </div>
+
+                  {/* Message Template */}
+                  <div className="space-y-1 sm:col-span-2">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <label className="font-extrabold text-slate-700">WhatsApp Message Template:</label>
+                      <span className="font-mono text-slate-500">Tags: {"{{name}}"}, {"{{date}}"}, {"{{time}}"}, {"{{meeting_url}}"}</span>
+                    </div>
+                    <textarea
+                      rows={2}
+                      value={ruleTemplate}
+                      onChange={(e) => setRuleTemplate(e.target.value)}
+                      className="w-full bg-white border border-slate-300 rounded-xl p-3 text-xs font-medium text-slate-900 focus:outline-none focus:border-indigo-600"
+                      placeholder="Enter WhatsApp message..."
+                      required
+                    ></textarea>
+                  </div>
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={isSavingRule}
+                  className="bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-extrabold px-5 py-2 rounded-xl shadow-md transition-all flex items-center space-x-2 disabled:opacity-50 cursor-pointer"
+                >
+                  {isSavingRule ? (
+                    <i className="fa-solid fa-circle-notch fa-spin text-xs"></i>
+                  ) : (
+                    <i className="fa-solid fa-bolt text-xs"></i>
+                  )}
+                  <span>Save Stage Automation Rule ⚡</span>
+                </button>
+              </form>
+
+              {/* List of Configured Stage Rules */}
+              <div className="space-y-3">
+                <h4 className="text-xs font-extrabold text-slate-900 uppercase tracking-wider">
+                  Configured Rules for {activeAutomationStage.name} ({(stageAutomationsMap[activeAutomationStage.id] || []).length})
+                </h4>
+
+                {(stageAutomationsMap[activeAutomationStage.id] || []).length === 0 ? (
+                  <div className="p-6 border border-dashed border-slate-200 rounded-2xl text-center space-y-1">
+                    <span className="text-xs font-bold text-slate-500">No automation rules configured for this stage yet.</span>
+                    <p className="text-[11px] text-slate-400">Use the form above to add your first WhatsApp automation rule!</p>
+                  </div>
+                ) : (
+                  <div className="space-y-2.5 max-h-64 overflow-y-auto pr-1 font-sans">
+                    {(stageAutomationsMap[activeAutomationStage.id] || []).map((rule) => (
+                      <div
+                        key={rule.id}
+                        className="bg-white border border-slate-200 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-2xs"
+                      >
+                        <div className="space-y-1 flex-1 min-w-0">
+                          <div className="flex items-center space-x-2 flex-wrap gap-y-1">
+                            <span className="text-xs font-extrabold text-slate-900">{rule.title}</span>
+                            <span className="text-[10px] font-mono font-bold bg-indigo-50 text-indigo-700 px-2 py-0.5 rounded border border-indigo-200 uppercase">
+                              {rule.offsetValue} {rule.offsetUnit} {rule.triggerBase === "created" ? "after" : rule.offsetType} ({rule.triggerBase})
+                            </span>
+                          </div>
+                          <p className="text-xs text-slate-600 italic truncate font-mono">
+                            "{rule.template}"
+                          </p>
+                        </div>
+
+                        <button
+                          onClick={() => handleDeleteStageRule(activeAutomationStage.id, rule.id)}
+                          className="bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 text-xs font-extrabold px-3 py-1.5 rounded-xl transition-colors cursor-pointer flex-shrink-0"
+                        >
+                          Delete 🗑️
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Sticky Drawer Footer */}
+            <div className="px-6 py-3.5 border-t border-slate-200 bg-slate-50 flex items-center justify-end sticky bottom-0 z-20">
+              <button
+                onClick={() => setIsStageAutomationModalOpen(false)}
+                className="bg-slate-200 hover:bg-slate-300 text-slate-800 text-xs font-extrabold px-6 py-2 rounded-xl transition-colors cursor-pointer"
+              >
+                Close Automation Settings
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* LEAD WHATSAPP DISPATCH LOGS MODAL */}
+      {isLeadLogsModalOpen && selectedLeadForLogs && (
+        <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 font-sans">
+          <div className="fixed inset-0" onClick={() => setIsLeadLogsModalOpen(false)} />
+          <div className="relative w-full max-w-xl bg-white rounded-3xl shadow-2xl p-6 space-y-5 border border-slate-200 z-10 animate-in fade-in zoom-in duration-150">
+            {/* Header */}
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <div className="flex items-center space-x-3">
+                <div className="w-10 h-10 rounded-2xl bg-indigo-100 text-indigo-700 font-bold flex items-center justify-center text-lg">
+                  📜
+                </div>
+                <div>
+                  <h3 className="text-base font-extrabold text-slate-900">
+                    WhatsApp Logs: {selectedLeadForLogs.fullName || "Lead"}
+                  </h3>
+                  <p className="text-xs text-slate-500 font-medium">
+                    📞 +{selectedLeadForLogs.countryCode || "91"} {selectedLeadForLogs.phone} • Realtime Activity Logs
+                  </p>
+                </div>
+              </div>
+
+              <button
+                onClick={() => setIsLeadLogsModalOpen(false)}
+                className="w-8 h-8 rounded-full bg-slate-100 text-slate-500 hover:text-slate-900 font-bold flex items-center justify-center transition-colors cursor-pointer"
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Body */}
+            <div className="space-y-3 max-h-96 overflow-y-auto pr-1">
+              {isLoadingLeadLogs ? (
+                <div className="p-8 text-center text-slate-500 text-xs font-bold flex items-center justify-center space-x-2">
+                  <i className="fa-solid fa-circle-notch fa-spin text-indigo-600"></i>
+                  <span>Fetching WhatsApp Dispatch Logs...</span>
+                </div>
+              ) : leadLogsList.length === 0 ? (
+                <div className="p-8 border border-dashed border-slate-200 rounded-2xl text-center space-y-1">
+                  <span className="text-xs font-bold text-slate-600 block">No WhatsApp messages dispatched to this lead yet.</span>
+                  <p className="text-[11px] text-slate-400">
+                    Automations inspect leads every 15 seconds. Once triggered, dispatches will appear here instantly!
+                  </p>
+                </div>
+              ) : (
+                <>
+                  {leadLogsList.slice(0, visibleLogsCount).map((log: any) => (
+                    <div key={log.id} className="bg-slate-50 border border-slate-200 rounded-2xl p-3.5 space-y-2 text-xs">
+                      <div className="flex items-center justify-between">
+                        <span className="font-extrabold text-slate-900 flex items-center space-x-1.5">
+                          <span>⚡ {log.ruleTitle || "Automation Rule"}</span>
+                        </span>
+
+                        <span
+                          className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded border ${
+                            log.status === "sent"
+                              ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                              : "bg-rose-50 text-rose-700 border-rose-200"
+                          }`}
+                        >
+                          {log.status === "sent" ? "🟢 Sent" : "🔴 Failed"}
+                        </span>
+                      </div>
+
+                      <p className="text-[11px] text-slate-700 font-mono bg-white p-2 rounded-xl border border-slate-200">
+                        "{log.text}"
+                      </p>
+
+                      {log.error && (
+                        <div className="bg-rose-50 border border-rose-200 p-2 rounded-xl text-[10px] font-mono text-rose-700 space-y-0.5">
+                          <span className="font-bold block text-rose-800">⚠️ Failure Diagnostics:</span>
+                          <p>{typeof log.error === "object" ? JSON.stringify(log.error) : String(log.error)}</p>
+                        </div>
+                      )}
+
+                      <div className="flex items-center justify-between text-[10px] text-slate-400 font-mono pt-1">
+                        <span>🚀 Instance: {log.instanceName || "Default"}</span>
+                        <span>🕒 {new Date(log.timestamp).toLocaleString("en-IN")}</span>
+                      </div>
+                    </div>
+                  ))}
+
+                  {/* Load More Button for Pagination */}
+                  {leadLogsList.length > visibleLogsCount && (
+                    <button
+                      type="button"
+                      onClick={() => setVisibleLogsCount((prev) => prev + 20)}
+                      className="w-full bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 text-xs font-extrabold py-2.5 rounded-2xl transition-all cursor-pointer shadow-2xs flex items-center justify-center space-x-2"
+                    >
+                      <span>Load More WhatsApp Logs ({leadLogsList.length - visibleLogsCount} remaining) 👇</span>
+                    </button>
+                  )}
+                </>
+              )}
+            </div>
+
+            {/* Footer */}
+            <div className="pt-2 border-t border-slate-100 flex items-center justify-end">
+              <button
+                onClick={() => setIsLeadLogsModalOpen(false)}
+                className="bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-extrabold px-5 py-2 rounded-xl transition-colors cursor-pointer"
+              >
+                Close Logs
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* PERMANENT DELETE LEAD CONFIRMATION MODAL */}
+      {deleteConfirmModalLead && (
+        <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/75 backdrop-blur-xs flex items-center justify-center p-4 font-sans animate-in fade-in zoom-in duration-150">
+          <div className="fixed inset-0" onClick={() => !isDeletingLead && setDeleteConfirmModalLead(null)} />
+
+          <div className="relative w-full max-w-md bg-white rounded-3xl shadow-2xl overflow-hidden border border-rose-200 z-10 p-6 space-y-5">
+            {/* Header */}
+            <div className="flex items-center space-x-3 border-b border-slate-100 pb-4">
+              <div className="w-11 h-11 rounded-2xl bg-rose-100 border border-rose-200 text-rose-600 flex items-center justify-center font-black text-xl shadow-xs">
+                <i className="fa-solid fa-triangle-exclamation"></i>
+              </div>
+              <div>
+                <h3 className="text-base font-extrabold text-slate-900">
+                  Permanently Delete Lead?
+                </h3>
+                <p className="text-xs text-rose-600 font-bold">
+                  This action CANNOT be undone!
+                </p>
+              </div>
+            </div>
+
+            {/* Target Lead Record Details */}
+            <div className="bg-rose-50/70 border border-rose-200 rounded-2xl p-4 space-y-1.5 font-sans">
+              <div className="text-[10px] font-black uppercase text-rose-700 tracking-wider">
+                Target Lead Record
+              </div>
+              <div className="text-sm font-extrabold text-slate-900">
+                👤 {deleteConfirmModalLead.fullName || "Anonymous Lead"}
+              </div>
+              <div className="text-xs font-mono font-semibold text-slate-700 flex items-center space-x-3">
+                <span>📞 {deleteConfirmModalLead.phone || "N/A"}</span>
+                <span>✉️ {deleteConfirmModalLead.email || "N/A"}</span>
+              </div>
+              {deleteConfirmModalLead.meeting?.meetingDate && (
+                <div className="text-[11px] font-bold text-slate-600">
+                  📅 Scheduled Meeting: {deleteConfirmModalLead.meeting.meetingDate} ({deleteConfirmModalLead.meeting.meetingTime})
+                </div>
+              )}
+            </div>
+
+            {/* User Typing Confirmation Form */}
+            <div className="space-y-2">
+              <label className="block text-xs font-extrabold text-slate-700">
+                To confirm deletion, type <span className="bg-rose-100 text-rose-900 font-mono px-1.5 py-0.5 rounded border border-rose-300 font-black">delete</span> below:
+              </label>
+              <input
+                type="text"
+                autoFocus
+                placeholder="Type 'delete' to confirm"
+                value={deleteInputText}
+                onChange={(e) => setDeleteInputText(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && deleteInputText.trim().toLowerCase() === "delete" && !isDeletingLead) {
+                    handleConfirmDeleteLeadAction();
+                  }
+                }}
+                className="w-full bg-slate-50 border border-slate-300 focus:border-rose-600 focus:bg-white rounded-xl px-3.5 py-2.5 text-xs font-mono font-bold text-slate-900 outline-none transition-all placeholder:text-slate-400 placeholder:font-sans"
+              />
+            </div>
+
+            {/* Footer Buttons */}
+            <div className="flex items-center space-x-3 pt-2">
+              <button
+                type="button"
+                disabled={isDeletingLead}
+                onClick={() => {
+                  setDeleteConfirmModalLead(null);
+                  setDeleteInputText("");
+                }}
+                className="flex-1 bg-slate-100 hover:bg-slate-200 text-slate-700 font-extrabold text-xs py-2.5 rounded-xl transition-all border border-slate-200 cursor-pointer disabled:opacity-50"
+              >
+                Cancel
+              </button>
+
+              <button
+                type="button"
+                disabled={isDeletingLead || deleteInputText.trim().toLowerCase() !== "delete"}
+                onClick={handleConfirmDeleteLeadAction}
+                className="flex-1 bg-rose-600 hover:bg-rose-700 text-white font-black text-xs py-2.5 rounded-xl shadow-md transition-all flex items-center justify-center space-x-1.5 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <i className={`fa-solid fa-trash-can ${isDeletingLead ? "fa-spin" : ""}`}></i>
+                <span>{isDeletingLead ? "Deleting..." : "Permanently Delete Lead"}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
