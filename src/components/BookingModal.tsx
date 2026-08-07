@@ -83,8 +83,31 @@ export function isSlotTimePassed(
 async function sendWhatsAppDirectMessage(contactNumber: string, messageText: string) {
   const cleanPhone = contactNumber.replace(/\D/g, "");
   const formattedNumber = cleanPhone.startsWith("91") ? cleanPhone : `91${cleanPhone}`;
+  const apiKey = process.env.NEXT_PUBLIC_WHATSAPP_API_KEY || "vR39h6avY69g7kAU3YQbS6V6XEvudson";
 
-  // 1. Call server API proxy route to send via ev0.infispark.in (bypasses browser CORS restriction)
+  // 1. Direct call to Cloudflare Worker (talbina.infisparks.workers.dev) - has built-in CORS support
+  try {
+    const res = await fetch("https://talbina.infisparks.workers.dev/", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        instance: "Ahtemad",
+        number: formattedNumber,
+        text: messageText,
+        apikey: apiKey,
+      }),
+    });
+    if (res.ok) {
+      console.log(`✅ WhatsApp message sent to ${formattedNumber} via Cloudflare Worker (talbina.infisparks.workers.dev)`);
+      return;
+    }
+  } catch (error) {
+    console.warn("⚠️ Cloudflare Worker error, trying internal Next.js API route fallback:", error);
+  }
+
+  // 2. Fallback to Next.js API route (/api/whatsapp/send)
   try {
     const res = await fetch("/api/whatsapp/send", {
       method: "POST",
@@ -95,32 +118,14 @@ async function sendWhatsAppDirectMessage(contactNumber: string, messageText: str
         instance: "Ahtemad",
         number: formattedNumber,
         text: messageText,
+        apikey: apiKey,
       }),
     });
     const data = await res.json();
     if (res.ok && data.success) {
-      console.log(`✅ WhatsApp message sent to ${formattedNumber} via ev0.infispark.in API proxy`);
+      console.log(`✅ WhatsApp message sent to ${formattedNumber} via internal API route proxy`);
       return;
     }
-  } catch (error) {
-    console.warn("⚠️ Internal WhatsApp proxy error, trying fallback:", error);
-  }
-
-  // 2. Fallback to direct ev0 call or fallback endpoint if proxy unavailable
-  try {
-    const apiKey = process.env.NEXT_PUBLIC_WHATSAPP_API_KEY || "vR39h6avY69g7kAU3YQbS6V6XEvudson";
-    await fetch("https://ev0.infispark.in/message/sendText/Ahtemad", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        apikey: apiKey,
-      },
-      body: JSON.stringify({
-        number: formattedNumber,
-        text: messageText,
-      }),
-    });
-    console.log(`✅ WhatsApp message sent to ${formattedNumber} via direct ev0.infispark.in`);
   } catch (fallbackError) {
     console.error("❌ WhatsApp fallback error:", fallbackError);
   }
