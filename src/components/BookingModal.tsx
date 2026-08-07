@@ -86,7 +86,7 @@ async function sendWhatsAppDirectMessage(contactNumber: string, messageText: str
 
   // 1. Direct call to https://ev0.infispark.in/message/sendText/mudassir (User API format)
   try {
-    const res = await fetch("https://ev0.infispark.in/message/sendText/mudassir", {
+    const res = await fetch("https://ev0.infispark.in/message/sendText/Ahtemad", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
