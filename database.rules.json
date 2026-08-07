@@ -5,7 +5,7 @@
       ".write": true
     },
     "campaigns": {
-      ".read": true,
+      ".read": "auth != null && auth.uid === 'yVLNwSHnvCROu8EEznAfkwbHTZg1'",
       ".write": true
     },
     "$other": {
