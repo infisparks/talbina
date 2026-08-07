@@ -193,6 +193,22 @@ export function BookingModal({
     }
   }, [isOpen, initialStep, initialLeadId, initialCreatedDate]);
 
+  // Dynamically sync browser URL path with active booking modal step
+  useEffect(() => {
+    if (!isOpen || typeof window === "undefined") return;
+
+    const preserved = getPreservedQueryString();
+    let targetPath = "/detail";
+    if (step === 1) targetPath = "/detail";
+    else if (step === 2) targetPath = "/survey";
+    else if (step === 3) targetPath = "/meeting";
+    else if (step === 4) targetPath = "/success";
+
+    if (window.location.pathname !== targetPath) {
+      window.history.pushState({}, "", targetPath + preserved);
+    }
+  }, [isOpen, step]);
+
   // Load existing lead state & LocalStorage cache when modal opens
   useEffect(() => {
     if (!isOpen) return;
@@ -489,8 +505,9 @@ export function BookingModal({
     setSelectedTimeSlot(null);
     setPhoneError(null);
 
-    if (typeof window !== "undefined" && window.location.search) {
-      window.history.replaceState({}, "", window.location.pathname);
+    if (typeof window !== "undefined") {
+      const preserved = getPreservedQueryString();
+      window.history.pushState({}, "", "/" + preserved);
     }
 
     onClose();

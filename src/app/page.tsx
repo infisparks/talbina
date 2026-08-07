@@ -34,14 +34,14 @@ function URLParamsHandler({
 
     let targetStep: 1 | 2 | 3 | 4 | null = null;
 
-    if (pathname === "/form") targetStep = 1;
-    else if (pathname === "/survey") targetStep = 2;
+    if (pathname === "/detail" || pathname === "/form") targetStep = 1;
+    else if (pathname === "/survey" || pathname === "/survery") targetStep = 2;
     else if (pathname === "/meeting") targetStep = 3;
     else if (pathname === "/success") targetStep = 4;
-    else if (stepParam === "survey" || stepParam === "2") targetStep = 2;
+    else if (stepParam === "survey" || stepParam === "survery" || stepParam === "2") targetStep = 2;
     else if (stepParam === "meeting" || stepParam === "3") targetStep = 3;
     else if (stepParam === "4" || stepParam === "success") targetStep = 4;
-    else if (stepParam === "1" || stepParam === "contact" || stepParam === "form" || stepParam === "book" || bookingParam) targetStep = 1;
+    else if (stepParam === "1" || stepParam === "contact" || stepParam === "detail" || stepParam === "form" || stepParam === "book" || bookingParam) targetStep = 1;
     else if (campaignParam) targetStep = 1;
 
     if (targetStep !== null) {
@@ -122,13 +122,11 @@ export default function Home({
   const handleOpenBooking = useCallback(() => {
     if (typeof window !== "undefined") {
       const preserved = getPreservedQueryString();
-      window.history.replaceState({}, "", window.location.pathname + preserved);
+      window.history.pushState({}, "", "/detail" + preserved);
     }
 
-    fbEvent("Lead", {
+    fbEvent("ViewContent", {
       content_name: "Talbina Apply CTA Click",
-      currency: "INR",
-      value: 0,
     });
     fbCustomEvent("ButtonClick", {
       button_name: "Distributor Partnership Apply CTA",
@@ -144,6 +142,11 @@ export default function Home({
   }, []);
 
   const handleCloseBooking = useCallback(() => {
+    if (typeof window !== "undefined") {
+      const preserved = getPreservedQueryString();
+      window.history.pushState({}, "", "/" + preserved);
+    }
+
     setBookingConfig({
       isOpen: false,
       step: 1,
